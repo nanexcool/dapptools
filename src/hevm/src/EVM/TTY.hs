@@ -3,7 +3,7 @@
 
 module EVM.TTY where
 
-import Prelude hiding (head, Word)
+import Prelude hiding (lookup, Word)
 
 import Brick
 import Brick.Widgets.Border
@@ -42,11 +42,11 @@ import Control.Monad.State.Strict hiding (state)
 import Data.Aeson.Lens
 import Data.ByteString (ByteString)
 import Data.Maybe (isJust, fromJust, fromMaybe)
+import Data.Map (Map, insert, lookup, lookupLT, singleton)
 import Data.Monoid ((<>))
 import Data.Text (Text, unpack, pack)
 import Data.Text.Encoding (decodeUtf8)
 import Data.List (sort)
-import Data.Vector (Vector, head, singleton, (!))
 import Data.Version (showVersion)
 import Numeric (showHex)
 
@@ -85,7 +85,7 @@ data UiVmState = UiVmState
   , _uiVmSolc         :: Maybe SolcContract
   , _uiVmDapp         :: Maybe DappInfo
   , _uiVmStepCount    :: Int
-  , _uiVmSnapshots    :: Vector UiVmState
+  , _uiVmSnapshots    :: Map Int UiVmState
   , _uiVmMessage      :: Maybe String
   , _uiVmNotes        :: [String]
   , _uiVmShowMemory   :: Bool
@@ -257,7 +257,7 @@ maybeSaveSnapshot = do
   ui <- get
   let n = view uiVmStepCount ui
   if n > 0 && n `mod` snapshotInterval == 0
-    then modifying uiVmSnapshots (`snoc` ui)
+    then modifying uiVmSnapshots (insert n ui)
     else pure ()
 
 isUnitTestContract :: Text -> DappInfo -> Bool
@@ -297,7 +297,7 @@ runFromVM vm = do
            , _uiVmShowMemory = False
            , _uiVmTestOpts = opts
            }
-    ui1 = updateUiVmState ui0 vm & set uiVmSnapshots (singleton ui1)
+    ui1 = updateUiVmState ui0 vm & set uiVmSnapshots (singleton 0 ui1)
 
   ui2 <- customMain mkVty Nothing (app opts) (ViewVm ui1)
   case ui2 of
@@ -474,7 +474,7 @@ appEvent (ViewVm s) (VtyEvent (V.EvKey (V.KChar 'e') [])) =
 
 -- Vm Overview: a - step
 appEvent (ViewVm s) (VtyEvent (V.EvKey (V.KChar 'a') [])) =
-  takeStep (head (view uiVmSnapshots s)) StepTimidly StepNone
+  takeStep (fromJust (lookup 0 (view uiVmSnapshots s))) StepTimidly StepNone
 
 -- Vm Overview: p - step
 appEvent st@(ViewVm s) (VtyEvent (V.EvKey (V.KChar 'p') [])) =
@@ -489,11 +489,12 @@ appEvent st@(ViewVm s) (VtyEvent (V.EvKey (V.KChar 'p') [])) =
       -- We keep the current cache so we don't have to redo
       -- any blocking queries, and also the memory view.
       let
-        s0 = (view uiVmSnapshots s) ! (div (n - 1) snapshotInterval)
+        -- snapshots = view uiVmSnapshots s
+        (snapshotStep, s0) = fromJust $ lookupLT n (view uiVmSnapshots s)
         s1 = set (uiVm . cache)   (view (uiVm . cache) s) s0
         s2 = set (uiVmShowMemory) (view uiVmShowMemory s) s1
         s3 = set (uiVmTestOpts)   (view uiVmTestOpts s) s2
-        stepsToTake = (n - 1) `mod` snapshotInterval
+        stepsToTake = n - snapshotStep - 1
 
       -- Take the steps; "timidly," because all queries
       -- ought to be cached.
@@ -590,7 +591,7 @@ initialUiVmStateForTest opts dapp (theContractName, theTestName) =
     vm0 =
       initialUnitTestVm opts testContract (Map.elems (view dappSolcByName dapp))
     ui1 =
-      updateUiVmState ui0 vm0 & set uiVmSnapshots (singleton ui1)
+      updateUiVmState ui0 vm0 & set uiVmSnapshots (singleton 0 ui1)
 
 myTheme :: [(AttrName, V.Attr)]
 myTheme =
