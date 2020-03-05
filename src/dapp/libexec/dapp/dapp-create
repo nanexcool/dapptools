@@ -16,8 +16,22 @@ for i in "$@"; do
   esac
 done
 
-bin=$DAPP_OUT/${1?missing contract name}.bin
-type=$(seth --abi-constructor <"$DAPP_OUT/$1.abi")
+mapfile -t contracts < <(<"$DAPP_JSON" jq '.contracts|keys[]' -r)
+
+for path in "${contracts[@]}"; do
+  [[ "${path#*:}" = "$1" ]] && {
+    name="$path"
+    break
+  }
+done
+
+[[ "$name" ]] || exit 1 # not found
+
+data=$(<"$DAPP_JSON" jq '.contracts' -r)
+contract=$(echo "$data" | jq '.[''"'"$path"'"'']')
+abi=$(jq '.["abi"]' -r <<< "$contract")
+bin=$(jq '.["bin"]' -r <<< "$contract")
+type=$(seth --abi-constructor <<< "$abi")
 address=$(set -x; seth send --create "$bin" "${type/constructor/${1##*/}}" "${@:2}")
 
 [[ $DAPP_VERIFY_CONTRACT ]] && {
