@@ -59,6 +59,11 @@ Contents
       * [`seth --from-bin`]
       * [`seth --from-wei`]
       * [`seth --to-wei`]
+      * [`seth --to-int256`]
+      * [`seth --to-uint256`]
+      * [`seth --to-bytes32`]
+      * [`seth --to-address`]
+      * [`seth --calldata-decode`]
       * [`seth age`]
       * [`seth balance`]
       * [`seth block`]
@@ -68,6 +73,7 @@ Contents
       * [`seth code`]
       * [`seth estimate`]
       * [`seth events`]
+      * [`seth gas-price`]
       * [`seth help`]
       * [`seth keccak`]
       * [`seth logs`]
@@ -127,8 +133,7 @@ or the flag `--rpc-url`.
 
 Alternatively, you can use a default remote node (operated by
 [Infura]) using the variable `SETH_CHAIN` or the flag `--chain` (or
-`-C`).  Allowed values: `ethlive` (aka `mainnet`), `ropsten`, `kovan`,
-and `rinkeby`.
+`-C`).  Allowed values: `ethlive` (aka `mainnet`), `ropsten`, `kovan`, `rinkeby`, and `goerli`.
 
 Note: If you frequently use Seth with the Infura nodes, you should
 [sign up for an Infura API key](https://infura.io/register) and use your
@@ -330,6 +335,37 @@ Convert an ETH amount into wei.
 
 The unit may be `wei`, `gwei`, `eth`, or `ether`.
 
+### `seth --to-int256`
+
+Convert a number into int256 hex string with 0x prefix.
+
+    seth --to-int256 <value>
+
+### `seth --to-uint256`
+
+Convert a number into uint256 hex string with 0x prefix.
+
+    seth --to-uint256 <value>
+
+### `seth --to-bytes32`
+
+Pad a hex string to the right with zeroes to 32 bytes.
+
+    seth --to-bytes32 <value>
+
+### `seth --to-address`
+
+Convert an address into a checksummed address.
+
+    seth --to-address <address>
+
+### `seth --calldata-decode`
+
+Decodes a calldata bytestring into a list of input arguments.
+
+    seth --calldata-decode <signature> <hexstring>
+
+    
 ### `seth age`
 
 Show the timestamp of a block (the latest block by default).
@@ -397,7 +433,7 @@ and normalize it to lowercase.
 Print the symbolic name of the current blockchain by checking the
 genesis block hash.
 
-Outputs one of `ethlive`, `etclive`, `kovan`, `ropsten`, `morden`,
+Outputs one of `ethlive`, `etclive`, `kovan`, `ropsten`, `goerli`, `morden`,
 `rinkeby`, or `unknown`.
 
 ### `seth code`
@@ -438,6 +474,10 @@ With `--follow`, the command blocks waiting for new events (like `tail
 -f`).
 
 See also [`seth logs`] which does not decode events.
+
+### `seth gas-price`
+
+Reads the current gas price at target chain.
 
 ### `seth keccak`
 
@@ -572,6 +612,11 @@ Show all fields unless `<field>` is given.
 [`seth --from-bin`]: #seth---from-bin
 [`seth --from-wei`]: #seth---from-wei
 [`seth --to-wei`]: #seth---to-wei
+[`seth --to-int256`]: #seth---to-int256
+[`seth --to-uint256`]: #seth---to-uint256
+[`seth --to-bytes32`]: #seth---to-bytes32
+[`seth --to-address`]: #seth---to-address
+[`seth gas-price`]: #seth-gas-price
 [`seth abi`]: #seth-abi
 [`seth age`]: #seth-age
 [`seth balance`]: #seth-balance

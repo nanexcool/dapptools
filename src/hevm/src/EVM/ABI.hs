@@ -38,27 +38,32 @@ module EVM.ABI
   , putAbi
   , getAbi
   , getAbiSeq
+  , genAbiValue
   , abiValueType
   , abiTypeSolidity
   , abiCalldata
+  , abiMethod
+  , emptyAbi
   , encodeAbiValue
+  , decodeAbiValue
   , parseTypeName
   ) where
 
 import EVM.Keccak (abiKeccak)
-import EVM.Types ()
+import EVM.Types
 
 import Control.Monad      (replicateM, replicateM_, forM_, void)
-import Data.Binary.Get    (Get, label, getWord8, getWord32be, skip)
+import Data.Binary.Get    (Get, runGet, label, getWord8, getWord32be, skip)
 import Data.Binary.Put    (Put, runPut, putWord8, putWord32be)
 import Data.Bits          (shiftL, shiftR, (.&.))
 import Data.ByteString    (ByteString)
-import Data.DoubleWord    (Word256, Int256, Word160, signedWord)
+import Data.DoubleWord    (Word256, Int256, signedWord)
 import Data.Monoid        ((<>))
 import Data.Text          (Text, pack)
 import Data.Text.Encoding (encodeUtf8)
 import Data.Vector        (Vector)
 import Data.Word          (Word32, Word8)
+import Data.List          (intercalate)
 import GHC.Generics
 
 import Test.QuickCheck hiding ((.&.), label)
@@ -74,7 +79,7 @@ import qualified Text.Megaparsec.Char as P
 data AbiValue
   = AbiUInt         Int Word256
   | AbiInt          Int Int256
-  | AbiAddress      Word160
+  | AbiAddress      Addr
   | AbiBool         Bool
   | AbiBytes        Int BS.ByteString
   | AbiBytesDynamic BS.ByteString
@@ -82,7 +87,23 @@ data AbiValue
   | AbiArrayDynamic AbiType (Vector AbiValue)
   | AbiArray        Int AbiType (Vector AbiValue)
   | AbiTuple        (Vector AbiValue)
-  deriving (Show, Read, Eq, Ord, Generic)
+  deriving (Read, Eq, Ord, Generic)
+
+-- | Pretty-print some 'AbiValue'.
+instance Show AbiValue where
+  show (AbiUInt _ n)         = show n
+  show (AbiInt  _ n)         = show n
+  show (AbiAddress n)        = showAddrWith0x n
+  show (AbiBool b)           = if b then "true" else "false"
+  show (AbiBytes      _ b)   = show (ByteStringS b)
+  show (AbiBytesDynamic b)   = show (ByteStringS b)
+  show (AbiString       s)   = show s
+  show (AbiArrayDynamic _ v) =
+    "[" ++ intercalate ", " (show <$> Vector.toList v) ++ "]"
+  show (AbiArray      _ _ v) =
+    "[" ++ intercalate ", " (show <$> Vector.toList v) ++ "]"
+  show (AbiTuple v) =
+    "(" ++ intercalate ", " (show <$> Vector.toList v) ++ ")"
 
 data AbiType
   = AbiUIntType         Int
@@ -301,6 +322,14 @@ putAbiSeq xs =
 encodeAbiValue :: AbiValue -> BS.ByteString
 encodeAbiValue = BSLazy.toStrict . runPut . putAbi
 
+decodeAbiValue :: AbiType -> BSLazy.ByteString -> AbiValue
+decodeAbiValue = runGet . getAbi
+
+abiMethod :: Text -> AbiValue -> BS.ByteString
+abiMethod s args = BSLazy.toStrict . runPut $ do
+  putWord32be (abiKeccak (encodeUtf8 s))
+  putAbi args
+
 abiCalldata :: Text -> Vector AbiValue -> BS.ByteString
 abiCalldata s xs = BSLazy.toStrict . runPut $ do
   putWord32be (abiKeccak (encodeUtf8 s))
@@ -364,6 +393,9 @@ getWord256 = pack32 8 <$> replicateM 8 getWord32be
 
 roundTo256Bits :: Integral a => a -> a
 roundTo256Bits n = 32 * div (n + 255) 256
+
+emptyAbi :: AbiValue
+emptyAbi = AbiTuple mempty
 
 getBytesWith256BitPadding :: Integral a => a -> Get ByteString
 getBytesWith256BitPadding i =

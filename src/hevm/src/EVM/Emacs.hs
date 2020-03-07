@@ -18,6 +18,7 @@ import Data.SCargot.Repr.Basic
 import Data.Set (Set)
 import Data.Text (Text, pack, unpack)
 import EVM
+import EVM.ABI
 import EVM.Concrete
 import EVM.Dapp
 import EVM.Debug (srcMapCodePos)
@@ -506,6 +507,8 @@ defaultUnitTestOptions = do
     { oracle            = Fetch.zero
     , verbose           = Nothing
     , match             = ""
+    , fuzzRuns          = 100
+    , replay            = Nothing
     , vmModifier        = id
     , testParams        = params
     }
@@ -522,7 +525,7 @@ initialStateForTest opts@(UnitTestOptions {..}) dapp (contractPath, testName) =
       Stepper.evm . pushTrace . EntryTrace $
         "test " <> testName <> " (" <> contractPath <> ")"
       initializeUnitTest opts
-      void (runUnitTest opts testName)
+      void (runUnitTest opts testName (AbiTuple mempty))
     ui0 =
       UiVmState
         { _uiVm             = vm0
@@ -593,6 +596,8 @@ opString (i, o) = (showPc i <> " ") ++ case o of
   OpNumber -> "NUMBER"
   OpDifficulty -> "DIFFICULTY"
   OpGaslimit -> "GASLIMIT"
+  OpChainid -> "CHAINID"
+  OpSelfbalance -> "SELFBALANCE"
   OpPop -> "POP"
   OpMload -> "MLOAD"
   OpMstore -> "MSTORE"

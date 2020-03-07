@@ -379,12 +379,13 @@ errorFatal TooManyBlocks = True
 errorFatal TooManyTxs = True
 errorFatal TargetMissing = True
 errorFatal SignatureUnverified = True
+errorFatal InvalidTx = True
 errorFatal _ = False
 
 fromBlockchainCase :: BlockchainCase -> Either BlockchainError Case
 fromBlockchainCase (BlockchainCase blocks preState postState network) =
   case (blocks, network) of
-    ((block : []), "ConstantinopleFix") -> case blockTxs block of
+    ((block : []), "Istanbul") -> case blockTxs block of
       (tx : []) -> case txToAddr tx of
         Nothing -> fromCreateBlockchainCase block tx preState postState
         Just _  -> fromNormalBlockchainCase block tx preState postState
@@ -402,7 +403,7 @@ fromCreateBlockchainCase block tx preState postState =
     (Nothing, _) -> Left SignatureUnverified
     (_, Nothing) -> Left FailedCreate
     (Just origin, Just (checkState, createdAddr)) -> let
-      feeSchedule = EVM.FeeSchedule.metropolis
+      feeSchedule = EVM.FeeSchedule.istanbul
       in Right $ Case
          (EVM.VMOpts
           { vmoptCode          = txData tx
@@ -432,7 +433,7 @@ fromNormalBlockchainCase :: Block -> Transaction
                        -> Either BlockchainError Case
 fromNormalBlockchainCase block tx preState postState =
   let Just toAddr = txToAddr tx
-      feeSchedule = EVM.FeeSchedule.metropolis
+      feeSchedule = EVM.FeeSchedule.istanbul
       toCode = Map.lookup toAddr preState
       theCode = case toCode of
           Nothing -> ""
@@ -552,6 +553,7 @@ vmForCase mode x =
     EVM.makeVm (testVmOpts x)
     & EVM.env . EVM.contracts .~ realizeContracts initState
     & EVM.tx . EVM.txReversion .~ realizeContracts checkState
+    & EVM.tx . EVM.origStorage .~ realizeContracts initState
     & EVM.tx . EVM.substate . EVM.touchedAccounts .~ touchedAccounts
     & EVM.execMode .~ mode
 

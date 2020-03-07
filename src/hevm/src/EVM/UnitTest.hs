@@ -1,5 +1,4 @@
 {-# LANGUAGE ViewPatterns #-}
-
 module EVM.UnitTest where
 
 import Prelude hiding (Word)
@@ -11,7 +10,6 @@ import EVM.Dapp
 import EVM.Debug (srcMapCodePos)
 import EVM.Exec
 import EVM.Format
-import EVM.Keccak
 import EVM.Solidity
 import EVM.Types
 import EVM.Concrete (w256, wordAt, wordValue)
@@ -29,14 +27,14 @@ import qualified Control.Monad.State.Strict as State
 import Control.Monad.Par.Class (spawn_)
 import Control.Monad.Par.IO (runParIO)
 
+import qualified Data.ByteString.Lazy as BSLazy
 import Data.ByteString    (ByteString)
 import Data.Foldable      (toList)
 import Data.Map           (Map)
-import Data.Maybe         (fromMaybe, catMaybes, fromJust, fromMaybe, mapMaybe)
+import Data.Maybe         (fromMaybe, catMaybes, fromJust, isJust, fromMaybe, mapMaybe)
 import Data.Monoid        ((<>))
 import Data.Text          (Text, pack, unpack)
 import Data.Text          (isPrefixOf, stripSuffix, intercalate)
-import Data.Text.Encoding (encodeUtf8)
 import Data.Word          (Word32)
 import System.Environment (lookupEnv)
 import System.IO          (hFlush, stdout)
@@ -57,11 +55,15 @@ import qualified Data.Set as Set
 import Data.Vector (Vector)
 import qualified Data.Vector as Vector
 
+import Test.QuickCheck hiding (verbose)
+
 data UnitTestOptions = UnitTestOptions
   {
     oracle     :: Query -> IO (EVM ())
   , verbose    :: Maybe Int
   , match      :: Text
+  , fuzzRuns   :: Int
+  , replay     :: Maybe (Text, BSLazy.ByteString)
   , vmModifier :: VM -> VM
   , testParams :: TestVMParams
   }
@@ -81,6 +83,7 @@ data TestVMParams = TestVMParams
   , testGasprice      :: W256
   , testMaxCodeSize   :: W256
   , testDifficulty    :: W256
+  , testChainId       :: W256
   }
 
 defaultGasForCreating :: W256
@@ -125,7 +128,7 @@ initializeUnitTest UnitTestOptions { .. } = do
   -- Initialize the test contract
   Stepper.evm (popTrace >> pushTrace (EntryTrace "initialize test"))
   Stepper.evm $
-    setupCall testParams addr "setUp()"
+    setupCall testParams addr "setUp()" emptyAbi
 
   Stepper.note "Running `setUp()'"
 
@@ -138,18 +141,18 @@ initializeUnitTest UnitTestOptions { .. } = do
 
 -- | Assuming a test contract is loaded and initialized, this stepper
 -- will run the specified test method and return whether it succeeded.
-runUnitTest :: UnitTestOptions -> ABIMethod -> Stepper Bool
-runUnitTest a method = do
-  x <- execTest a method
-  checkFailures a method x
+runUnitTest :: UnitTestOptions -> ABIMethod -> AbiValue -> Stepper Bool
+runUnitTest a method args = do
+  x <- execTest a method args
+  checkFailures a method args x
 
-execTest :: UnitTestOptions -> ABIMethod -> Stepper Bool
-execTest UnitTestOptions { .. } method = do
+execTest :: UnitTestOptions -> ABIMethod -> AbiValue -> Stepper Bool
+execTest UnitTestOptions { .. } method args = do
   -- The test subject should be loaded and initialized already
   addr <- Stepper.evm $ use (state . contract)
   -- Set up the call to the test method
   Stepper.evm $
-    setupCall testParams addr method
+    setupCall testParams addr method args
   Stepper.evm (pushTrace (EntryTrace method))
   Stepper.note "Running unit test"
   -- Try running the test method
@@ -164,8 +167,8 @@ execTest UnitTestOptions { .. } method = do
     _ -> pure ()
   pure bailed
 
-checkFailures :: UnitTestOptions -> ABIMethod -> Bool -> Stepper Bool
-checkFailures UnitTestOptions { .. } method bailed = do
+checkFailures :: UnitTestOptions -> ABIMethod -> AbiValue -> Bool -> Stepper Bool
+checkFailures UnitTestOptions { .. } method args bailed = do
      -- Decide whether the test is supposed to fail or succeed
      let shouldFail = "testFail" `isPrefixOf` method
 
@@ -174,14 +177,20 @@ checkFailures UnitTestOptions { .. } method bailed = do
 
      -- Ask whether any assertions failed
      Stepper.evm $ popTrace
-     Stepper.evm $ setupCall testParams addr "failed()"
+     Stepper.evm $ setupCall testParams addr "failed()" args
      Stepper.note "Checking whether assertions failed"
      res <- Stepper.execFullyOrFail >>= Stepper.decode AbiBoolType
      let AbiBool failed = res
      -- Return true if the test was successful
      pure (shouldFail == (bailed || failed))
 
-
+-- | Randomly generates the calldata arguments and runs the test
+fuzzTest :: UnitTestOptions -> Text -> [AbiType] -> VM -> Property
+fuzzTest opts sig types vm = forAllShow (genAbiValue (AbiTupleType $ Vector.fromList types)) (show . ByteStringS . encodeAbiValue)
+  $ \args -> ioProperty $ do
+    (runStateT (interpret opts (runUnitTest opts sig args)) vm) >>= \case
+      (Left _, _) -> return False
+      (Right b, _) -> return b
 
 tick :: Text -> IO ()
 tick x = Text.putStr x >> hFlush stdout
@@ -340,7 +349,7 @@ coverageForUnitTestContract
   :: UnitTestOptions
   -> Map Text SolcContract
   -> SourceCache
-  -> (Text, [Text])
+  -> (Text, [(Text, [AbiType])])
   -> IO (MultiSet SrcMap)
 coverageForUnitTestContract
   opts@(UnitTestOptions {..}) contractMap sources (name, testNames) = do
@@ -362,10 +371,10 @@ coverageForUnitTestContract
 
       -- Define the thread spawner for test cases
       let
-        runOne testName = spawn_ . liftIO $ do
+        runOne (testName, _) = spawn_ . liftIO $ do
           (x, (_, cov)) <-
             runStateT
-              (interpretWithCoverage opts (runUnitTest opts testName))
+              (interpretWithCoverage opts (runUnitTest opts testName emptyAbi))
               (vm1, mempty)
           case x of
             Right True -> pure cov
@@ -387,13 +396,13 @@ runUnitTestContract
   :: UnitTestOptions
   -> Map Text SolcContract
   -> SourceCache
-  -> (Text, [Text])
+  -> (Text, [(Text, [AbiType])])
   -> IO Bool
 runUnitTestContract
-  opts@(UnitTestOptions {..}) contractMap sources (name, testNames) = do
+  opts@(UnitTestOptions {..}) contractMap sources (name, testSigs) = do
 
   -- Print a header
-  putStrLn $ "Running " ++ show (length testNames) ++ " tests for "
+  putStrLn $ "Running " ++ show (length testSigs) ++ " tests for "
     ++ unpack name
 
   -- Look for the wanted contract by name from the Solidity info
@@ -423,17 +432,18 @@ runUnitTestContract
           pure False
         Just (VMSuccess _) -> do
 
-          -- Define the thread spawner for test cases
+          -- Define the thread spawner for normal test cases
           let
-            runOne testName = do
+            runOne testName args = do
+              let argInfo = pack (if args == emptyAbi then "" else " with arguments: " <> show args)
               x <-
                 runStateT
-                  (interpret opts (execTest opts testName))
+                  (interpret opts (execTest opts testName args))
                   vm1
               case x of
                 (Right b, vm2) -> do
                   y <- runStateT
-                    (interpret opts (checkFailures opts testName b))
+                    (interpret opts (checkFailures opts testName args b))
                     vm2
                   case y of
                     (Right True,  vm) ->
@@ -442,24 +452,64 @@ runUnitTestContract
                       in
                         pure
                         ("\x1b[32m[PASS]\x1b[0m "
-                         <> testName <> " (gas: " <> gasText <> ")"
+                         <> testName <> argInfo <> " (gas: " <> gasText <> ")"
                         , Right (passOutput vm dapp opts testName))
                     (Right False, vm) ->
                              pure ("\x1b[31m[FAIL]\x1b[0m "
-                             <> testName, Left (failOutput vm dapp opts testName))
+                             <> testName <> argInfo, Left (failOutput vm dapp opts testName))
                     (Left _, _)       ->
                              pure ("\x1b[33m[OOPS]\x1b[0m "
-                             <> testName, Left ("VM error for " <> testName))
+                             <> testName <> argInfo, Left ("VM error for " <> testName))
 
                 (Left _, _)       ->
                   pure ("\x1b[33m[OOPS]\x1b[0m "
-                        <> testName, Left ("VM error for " <> testName))
+                        <> testName <> argInfo, Left ("VM error for " <> testName))
+
+          -- Define the thread spawner for property based tests
+          let fuzzRun (testName, types) = do
+                let args = Args{ replay          = Nothing
+                               , maxSuccess      = fuzzRuns
+                               , maxDiscardRatio = 10
+                               , maxSize         = 100
+                               , chatty          = isJust verbose
+                               , maxShrinks      = maxBound
+                               }
+                res <- quickCheckWithResult args (fuzzTest opts testName types vm1)
+                case res of
+                  Success numTests _ _ _ _ _ ->
+                    pure ("\x1b[32m[PASS]\x1b[0m "
+                           <> testName <> " (runs: " <> (pack $ show numTests) <> ")",
+                           -- vm1 isn't quite the post vm we want...
+                           -- but the vm we want is not accessible here anyway...
+                           Right (passOutput vm1 dapp opts testName))
+                  Failure _ _ _ _ _ _ _ _ _ _ failCase _ _ ->
+                    let abiValue = decodeAbiValue (AbiTupleType (Vector.fromList types)) $ BSLazy.fromStrict $ hexText (pack $ concat failCase)
+                        ppOutput = pack $ show abiValue
+                    in do
+                    -- Run the failing test again to get a proper trace
+                    vm2 <- execStateT (interpret opts (runUnitTest opts testName abiValue)) vm1
+                    pure ("\x1b[31m[FAIL]\x1b[0m "
+                             <> testName <> ". Counterexample: " <> ppOutput
+                             <> "\nRun:\n dapp test --replay '(\"" <> testName <> "\",\""
+                             <> (pack (concat failCase)) <> "\")'\nto test this case again, or \n dapp debug --replay '(\""
+                             <> testName <> "\",\"" <> (pack (concat failCase)) <> "\")'\nto debug it.",
+                             Left (failOutput vm2 dapp opts testName))
+                  _ -> pure ("\x1b[31m[OOPS]\x1b[0m "
+                              <> testName, Left (failOutput vm1 dapp opts testName))
+
+          let runTest (testName, []) = runOne testName emptyAbi
+              runTest (testName, types) = case replay of
+                Nothing -> fuzzRun (testName, types)
+                Just (sig, callData) -> if sig == testName
+                                         then runOne testName $
+                                              decodeAbiValue (AbiTupleType (Vector.fromList types)) callData
+                                         else fuzzRun (testName, types)
 
           let inform = \(x, y) -> Text.putStrLn x >> pure y
 
-                -- Run all the test cases and print their status updates
+          -- Run all the test cases and print their status updates
           details <-
-            mapM (\x -> runOne x >>= inform) testNames
+            mapM (\x -> runTest x >>= inform) testSigs
 
           let running = [x | Right x <- details]
           let bailing = [x | Left x <- details]
@@ -545,12 +595,12 @@ formatTestLog events (Log _ args (topic:_)) =
 word32Bytes :: Word32 -> ByteString
 word32Bytes x = BS.pack [byteAt x (3 - i) | i <- [0..3]]
 
-setupCall :: TestVMParams -> Addr -> Text -> EVM ()
-setupCall params target abi = do
+setupCall :: TestVMParams -> Addr -> Text -> AbiValue -> EVM ()
+setupCall params target sig args  = do
   let TestVMParams {..} = params
   resetState
   loadContract target
-  assign (state . calldata) (word32Bytes (abiKeccak (encodeUtf8 abi)))
+  assign (state . calldata) $ abiMethod sig args
   assign (state . caller) testCaller
   assign (state . gas) (w256 testGasCall)
 
@@ -574,7 +624,7 @@ initialUnitTestVm (UnitTestOptions {..}) theContract _ =
            , vmoptGasprice = testGasprice
            , vmoptMaxCodeSize = testMaxCodeSize
            , vmoptDifficulty = testDifficulty
-           , vmoptSchedule = FeeSchedule.metropolis
+           , vmoptSchedule = FeeSchedule.istanbul
            , vmoptCreate = False
            }
     creator =
@@ -583,6 +633,7 @@ initialUnitTestVm (UnitTestOptions {..}) theContract _ =
         & set balance (w256 testBalanceCreate)
   in vm
     & set (env . contracts . at ethrunAddress) (Just creator)
+    & set (env . chainId) (w256 testChainId)
 
 getParametersFromEnvironmentVariables :: IO TestVMParams
 getParametersFromEnvironmentVariables = do
@@ -605,3 +656,4 @@ getParametersFromEnvironmentVariables = do
     <*> getWord "DAPP_TEST_GAS_PRICE" 0
     <*> getWord "DAPP_TEST_MAXCODESIZE" defaultMaxCodeSize
     <*> getWord "DAPP_TEST_DIFFICULTY" 1
+    <*> getWord "DAPP_TEST_CHAINID" 99

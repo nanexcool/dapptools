@@ -114,7 +114,7 @@ in rec {
         fetchNixpkgs { owner = "NixOS";   attr = super.system; }
         //
         fetchNixpkgs { owner = "dapphub"; attr = "unreleased"; };
-  solc = solc-versions.solc_0_5_12;
+  solc = solc-versions.solc_0_5_15;
 
   hevm = self.pkgs.haskell.lib.justStaticExecutables self.haskellPackages.hevm;
 
@@ -162,10 +162,6 @@ in rec {
         'GasLimit:   0xffffffffffffffff,'
     '';
   });
-
-  ethabi = self.callPackage ./nix/ethabi.nix {
-    inherit (self.darwin.apple_sdk.frameworks) Security;
-  };
 
   qrtx = self.bashScript {
     name = "qrtx";

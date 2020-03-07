@@ -39,6 +39,11 @@ data FeeSchedule n = FeeSchedule
   , g_blockhash :: n
   , g_extcodehash :: n
   , g_quaddivisor :: n
+  , g_ecadd :: n
+  , g_ecmul :: n
+  , g_pairing_point :: n
+  , g_pairing_base :: n
+  , g_fround :: n
   , r_block :: n
   } deriving Show
 
@@ -104,8 +109,52 @@ homestead = FeeSchedule
   , g_blockhash = 20
   , g_extcodehash = 400
   , g_quaddivisor = 20
+  , g_ecadd = 500
+  , g_ecmul = 40000
+  , g_pairing_point = 80000
+  , g_pairing_base = 100000
+  , g_fround = 1
   , r_block = 2000000000000000000
   }
 
 metropolis :: Num n => FeeSchedule n
 metropolis = eip160 . eip150 $ homestead
+
+-- EIP1108: Reduce alt_bn128 precompile gas costs
+-- <https://github.com/ethereum/EIPs/blob/master/EIPS/eip-1108.md>
+eip1108 :: EIP n
+eip1108 fees = fees
+  { g_ecadd = 150
+  , g_ecmul = 6000
+  , g_pairing_point = 34000
+  , g_pairing_base = 45000
+  }
+
+-- EIP1884: Repricing for trie-size-dependent opcodes
+-- <https://github.com/ethereum/EIPs/blob/master/EIPS/eip-1884.md>
+eip1884 :: EIP n
+eip1884 fees = fees
+  { g_sload = 800
+  , g_balance = 700
+  , g_extcodehash = 700
+  }
+
+-- EIP2028: Transaction data gas cost reduction
+-- <https://github.com/ethereum/EIPs/blob/master/EIPS/eip-2028.md>
+eip2028 :: EIP n
+eip2028 fees = fees
+  { g_txdatanonzero = 16
+  }
+
+-- EIP2200: Structured definitions for gas metering
+-- <https://github.com/ethereum/EIPs/blob/master/EIPS/eip-2200.md>
+eip2200 :: EIP n
+eip2200 fees = fees
+  { g_sload = 800
+  , g_sset = 20000   -- not changed
+  , g_sreset = 5000  -- not changed
+  , r_sclear = 15000 -- not changed
+  }
+
+istanbul :: Num n => FeeSchedule n
+istanbul = eip1108 . eip1884 . eip2028 . eip2200 $ metropolis

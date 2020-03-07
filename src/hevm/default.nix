@@ -1,6 +1,6 @@
 { mkDerivation, abstract-par, aeson, ansi-wl-pprint, async, base
 , base16-bytestring, base64-bytestring, binary, brick, bytestring
-, cereal, containers, cryptonite, data-dword, deepseq, directory
+, cborg, cereal, containers, cryptonite, data-dword, deepseq, directory
 , ff, fgl, filepath, free, ghci-pretty, haskeline, here, HUnit
 , lens, lens-aeson, megaparsec, memory, monad-par, mtl, multiset
 , operational, optparse-generic, process, QuickCheck
@@ -12,14 +12,14 @@
 }:
 mkDerivation {
   pname = "hevm";
-  version = "0.35";
+  version = "0.36";
   src = ./.;
   isLibrary = true;
   isExecutable = true;
   enableSeparateDataOutput = true;
   libraryHaskellDepends = [
     abstract-par aeson ansi-wl-pprint base base16-bytestring
-    base64-bytestring binary brick bytestring cereal containers
+    base64-bytestring binary brick bytestring cborg cereal containers
     cryptonite data-dword deepseq directory fgl filepath free
     ghci-pretty haskeline lens lens-aeson megaparsec memory monad-par
     mtl multiset operational optparse-generic process QuickCheck

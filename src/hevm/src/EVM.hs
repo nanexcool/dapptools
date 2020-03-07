@@ -217,6 +217,7 @@ data TxState = TxState
   , _substate        :: SubState
   , _isCreate        :: Bool
   , _txReversion     :: Map Addr Contract
+  , _origStorage     :: Map Addr Contract
   }
 
 -- | The "accrued substate" across a transaction
@@ -254,6 +255,7 @@ deriving instance Eq Contract
 -- | Various environmental data
 data Env = Env
   { _contracts :: Map Addr Contract
+  , _chainId   :: Word
   , _sha3Crack :: Map Word ByteString
   }
 
@@ -333,6 +335,8 @@ makeVm o = VM
     , _isCreate = vmoptCreate o
     , _txReversion = Map.fromList
       [(vmoptAddress o, initialContract (InitCode (vmoptCode o)))]
+    , _origStorage = Map.fromList
+      [(vmoptAddress o, initialContract (InitCode (vmoptCode o)))]
     }
   , _logs = mempty
   , _traces = Zipper.fromForest []
@@ -362,6 +366,7 @@ makeVm o = VM
     }
   , _env = Env
     { _sha3Crack = mempty
+    , _chainId = 1
     , _contracts = Map.fromList
       [(vmoptAddress o, initialContract (InitCode (vmoptCode o)))]
     }
@@ -411,7 +416,7 @@ exec1 = do
 
     doStop = finishFrame (FrameReturned "")
 
-  if self > 0x0 && self < 0x9 then do
+  if self > 0x0 && self <= 0x9 then do
     -- call to precompile
     let ?op = 0x00 -- dummy value
     let
@@ -753,6 +758,16 @@ exec1 = do
           limitStack 1 . burn g_base $
             next >> push (the block gaslimit)
 
+        -- op: CHAINID
+        0x46 ->
+          limitStack 1 . burn g_base $
+            next >> push (the env chainId)
+
+        -- op: SELFBALANCE
+        0x47 ->
+          limitStack 1 . burn g_low $
+            next >> push (view balance this)
+
         -- op: POP
         0x50 ->
           case stk of
@@ -806,18 +821,49 @@ exec1 = do
           notStatic $
           case stk of
             (x:new:xs) -> do
-              accessStorage self x $ \old -> do
-                -- Gas cost is higher when changing from zero to nonzero.
-                let cost = if old == 0 && new /= 0 then g_sset else g_sreset
+              accessStorage self x $ \current -> do
+                availableGas <- use (state . gas)
 
-                burn cost $ do
-                  next
-                  assign (state . stack) xs
-                  assign (env . contracts . ix (the state contract) . storage . at x)
-                    (Just new)
+                if availableGas <= g_callstipend
+                  then finishFrame (FrameErrored (OutOfGas availableGas g_callstipend))
+                  else do
+                    original <- use (tx . origStorage . at self . non
+                             (initialContract (EVM.RuntimeCode mempty))
+                             . storage . at x . non 0)
 
-                  -- Give gas refund if clearing the storage slot.
-                  if old /= 0 && new == 0 then refund r_sclear else noop
+                    let cost =
+                          if (current == new) then g_sload
+                          else if (current == original) && (original == 0) then g_sset
+                          else if (current == original) then g_sreset
+                          else g_sload
+
+                    burn cost $ do
+                      next
+                      assign (state . stack) xs
+                      assign (env . contracts . ix (the state contract) . storage . at x)
+                        (Just new)
+
+                      case (current == new) of
+                        True  -> noop
+                        False -> case (current == original) of
+
+                            True -> do if (original /= 0) && (new == 0)
+                                           then refund r_sclear
+                                           else noop
+
+                            False -> do if (original /= 0)
+                                            then
+                                              if (new == 0)
+                                                 then refund r_sclear
+                                                 else unRefund r_sclear
+                                            else noop
+
+                                        if (original == new)
+                                           then
+                                             if (original == 0)
+                                                then refund (g_sset - g_sload)
+                                                else refund (g_sreset - g_sload)
+                                           else noop
 
             _ -> underrun
 
@@ -902,7 +948,7 @@ exec1 = do
               : xs
              ) ->
               case xTo of
-                n | n > 0 && n <= 8 ->
+                n | n > 0 && n <= 9 ->
                   precompiledContract vm fees xGas xTo xTo xValue xInOffset xInSize xOutOffset xOutSize xs
                 n | num n == cheatCode ->
                   do
@@ -943,7 +989,7 @@ exec1 = do
               : xs
               ) ->
               case xTo of
-                n | n > 0 && n <= 8 ->
+                n | n > 0 && n <= 9 ->
                   precompiledContract vm fees xGas xTo self xValue xInOffset xInSize xOutOffset xOutSize xs
                 _ ->
                   accessMemoryRange fees xInOffset xInSize $
@@ -1001,7 +1047,7 @@ exec1 = do
           case stk of
             (xGas:(num -> xTo):xInOffset:xInSize:xOutOffset:xOutSize:xs) ->
               case xTo of
-                n | n > 0 && n <= 8 ->
+                n | n > 0 && n <= 9 ->
                   precompiledContract vm fees xGas xTo self 0 xInOffset xInSize xOutOffset xOutSize xs
                 n | num n == cheatCode -> do
                       assign (state . stack) xs
@@ -1038,7 +1084,7 @@ exec1 = do
           case stk of
             (xGas : (num -> xTo) : xInOffset : xInSize : xOutOffset : xOutSize : xs) ->
               case xTo of
-                n | n > 0 && n <= 8 ->
+                n | n > 0 && n <= 9 ->
                   precompiledContract vm fees xGas xTo xTo 0 xInOffset xInSize xOutOffset xOutSize xs
                 _ ->
                   accessMemoryRange fees xInOffset xInSize $
@@ -1157,6 +1203,10 @@ executePrecompile fees preCompileAddr gasCap inOffset inSize outOffset outSize x
   let input = readMemory (num inOffset) (num inSize) vm
       cost = costOfPrecompile fees preCompileAddr input
       notImplemented = error $ "precompile at address " <> show preCompileAddr <> " not yet implemented"
+      precompileFail = do burn (gasCap - cost) $ do
+                            assign (state . stack) (0 : xs)
+                            pushTrace $ ErrorTrace $ PrecompileFailure
+                            next
   if cost > gasCap then
     burn gasCap $ do
       assign (state . stack) (0 : xs)
@@ -1230,11 +1280,7 @@ executePrecompile fees preCompileAddr gasCap inOffset inSize outOffset outSize x
 
         -- ECADD
         0x6 -> case EVM.Precompiled.execute 0x6 (truncpad 128 input) 64 of
-          Nothing -> do
-            burn (gasCap - cost) $ do
-              assign (state . stack) (0 : xs)
-              pushTrace $ ErrorTrace $ PrecompileFailure
-              next
+          Nothing -> precompileFail
           Just output -> do
             let truncpaddedOutput = truncpad 64 output
             assign (state . stack) (1 : xs)
@@ -1244,11 +1290,7 @@ executePrecompile fees preCompileAddr gasCap inOffset inSize outOffset outSize x
 
         -- ECMUL
         0x7 -> case EVM.Precompiled.execute 0x7 (truncpad 96 input) 64 of
-          Nothing -> do
-            burn (gasCap - cost) $ do
-              assign (state . stack) (0 : xs)
-              pushTrace $ ErrorTrace $ PrecompileFailure
-              next
+          Nothing -> precompileFail
           Just output -> do
             let truncpaddedOutput = truncpad 64 output
             assign (state . stack) (1 : xs)
@@ -1258,17 +1300,26 @@ executePrecompile fees preCompileAddr gasCap inOffset inSize outOffset outSize x
 
         -- ECPAIRING
         0x8 -> case EVM.Precompiled.execute 0x8 input 32 of
-          Nothing -> do
-            burn (gasCap - cost) $ do
-              assign (state . stack) (0 : xs)
-              pushTrace $ ErrorTrace $ PrecompileFailure
-              next
+          Nothing -> precompileFail
           Just output -> do
             let truncpaddedOutput = truncpad 32 output
             assign (state . stack) (1 : xs)
             assign (state . returndata) truncpaddedOutput
             copyBytesToMemory truncpaddedOutput outSize 0 outOffset
             next
+
+        -- BLAKE2
+        0x9 -> case (BS.length input, 1 >= BS.last input) of
+          (213, True) -> case EVM.Precompiled.execute 0x9 input 64 of
+            Just output -> do
+              let truncpaddedOutput = truncpad 64 output
+              assign (state . stack) (1 : xs)
+              assign (state . returndata) truncpaddedOutput
+              copyBytesToMemory truncpaddedOutput outSize 0 outOffset
+              next
+            Nothing -> precompileFail
+          _ -> precompileFail
+
 
         _   -> notImplemented
 
@@ -1495,6 +1546,13 @@ refund n = do
   self <- use (state . contract)
   pushTo (tx . substate . refunds) (self, n)
 
+unRefund :: Word -> EVM ()
+unRefund n = do
+  self <- use (state . contract)
+  refs <- use (tx . substate . refunds)
+  assign (tx . substate . refunds)
+    (filter (\(a,b) -> not (a == self && b == n)) refs)
+
 touchAccount :: Addr -> EVM()
 touchAccount a =
   pushTo ((tx . substate) . touchedAccounts) a
@@ -1676,6 +1734,8 @@ create self this xGas xValue xs newAddr initCode = do
                             , creationContextSubstate = view (tx . substate) vm0
                             }
 
+        --reset origStorage if account already existed
+        assign (tx . origStorage . at newAddr . lifted) newContract
         zoom (env . contracts) $ do
           oldAcc <- use (at newAddr)
           let oldBal = case oldAcc of
@@ -2172,6 +2232,8 @@ readOp x _ = case x of
   0x43 -> OpNumber
   0x44 -> OpDifficulty
   0x45 -> OpGaslimit
+  0x46 -> OpChainid
+  0x47 -> OpSelfbalance
   0x50 -> OpPop
   0x51 -> OpMload
   0x52 -> OpMstore
@@ -2272,11 +2334,13 @@ costOfPrecompile (FeeSchedule {..}) precompileAddr input =
                   then (x * x) `div` 4 + 96 * x - 3072
                   else (x * x) `div` 16 + 480 * x - 199680
     -- ECADD
-    0x6 -> 500
+    0x6 -> g_ecadd
     -- ECMUL
-    0x7 -> 40000
+    0x7 -> g_ecmul
     -- ECPAIRING
-    0x8 -> num $ ((BS.length input) `div` 192) * 80000 + 100000
+    0x8 -> num $ ((BS.length input) `div` 192) * (num g_pairing_point) + (num g_pairing_base)
+    -- BLAKE2
+    0x9 -> g_fround * (num $ asInteger $ lazySlice 0 4 input)
     _ -> error ("unimplemented precompiled contract " ++ show precompileAddr)
 
 -- Gas cost of memory expansion
@@ -2287,9 +2351,7 @@ memoryCost FeeSchedule{..} byteCount =
     linearCost = g_memory * wordCount
     quadraticCost = div (wordCount * wordCount) 512
   in
-    if byteCount > exponentiate 2 32
-    then maxBound
-    else linearCost + quadraticCost
+    linearCost + quadraticCost
 
 -- * Arithmetic
 

@@ -198,10 +198,6 @@ instance FiniteBits Word where
   countLeadingZeros (C _ x) = countLeadingZeros x
   countTrailingZeros (C _ x) = countTrailingZeros x
 
-instance Bounded Word where
-  minBound = w256 minBound
-  maxBound = w256 maxBound
-
 instance Eq Word where
   (C _ x) == (C _ y) = x == y
 
@@ -245,7 +241,7 @@ x0 ^ y0 | y0 < 0    = errorWithoutStackTrace "Negative exponent"
                   | otherwise   = g (x * x) ((y - 1) `shiftR` 1) (x * z)
 
 createAddress :: Addr -> W256 -> Addr
-createAddress a n = num $ keccak $ rlpList [rlpencode $ BS $ word160Bytes a, rlpWord256 n]
+createAddress a n = num $ keccak $ rlpList [rlpWord160 a, rlpWord256 n]
 
 create2Address :: Addr -> W256 -> ByteString -> Addr
 create2Address a s b = num $ keccak $ mconcat $

@@ -11,10 +11,10 @@ import Brick.Widgets.Center
 import Brick.Widgets.List
 
 import EVM
-import EVM.ABI (abiTypeSolidity)
+import EVM.ABI (abiTypeSolidity, decodeAbiValue, AbiType(..), emptyAbi)
 import EVM.Concrete (Word (C))
 import EVM.Dapp (DappInfo, dappInfo)
-import EVM.Dapp (dappUnitTests, dappSolcByName, dappSolcByHash, dappSources)
+import EVM.Dapp (dappUnitTests, unitTestMethods, dappSolcByName, dappSolcByHash, dappSources)
 import EVM.Dapp (dappAstSrcMap)
 import EVM.Debug
 import EVM.Format (Signedness (..), showDec, showWordExact)
@@ -260,6 +260,8 @@ runFromVM vm = do
       { oracle            = Fetch.zero
       , verbose           = Nothing
       , match             = ""
+      , fuzzRuns          = 1
+      , replay            = error "irrelevant"
       , vmModifier        = id
       , testParams        = error "irrelevant"
       }
@@ -287,6 +289,16 @@ runFromVM vm = do
     ViewVm ui -> return (view uiVm ui)
     _ -> error "internal error: customMain returned prematurely"
 
+
+-- filters out fuzztests, unless they have
+-- explicitly been given an argument by `replay`
+concreteTests :: UnitTestOptions -> (Text, [(Text, [AbiType])]) -> [(Text, Text)]
+concreteTests UnitTestOptions{..} (contractname, tests) = case replay of
+  Nothing -> [(contractname, fst x) | x <- tests,
+                                      snd x == []]
+  Just (sig, _) -> [(contractname, fst x) | x <- tests,
+                                            snd x == [] || fst x == sig]
+
 main :: UnitTestOptions -> FilePath -> FilePath -> IO ()
 main opts root jsonFilePath = do
   readSolc jsonFilePath >>=
@@ -302,7 +314,7 @@ main opts root jsonFilePath = do
                   TestPickerPane
                   (Vec.fromList
                    (concatMap
-                    (\(a, xs) -> [(a, x) | x <- xs])
+                    (concreteTests opts)
                     (view dappUnitTests dapp)))
                   1
             , _testPickerDapp = dapp
@@ -380,6 +392,7 @@ appEvent (ViewContracts s) (VtyEvent e@(V.EvKey V.KUp [])) = do
 
 -- Vm Overview: Esc - return to test picker or exit
 appEvent st@(ViewVm s) (VtyEvent (V.EvKey V.KEsc [])) =
+  let opts = view uiVmTestOpts s in
   case view uiVmDapp s of
     Just dapp ->
       continue . ViewPicker $
@@ -389,11 +402,11 @@ appEvent st@(ViewVm s) (VtyEvent (V.EvKey V.KEsc [])) =
               TestPickerPane
               (Vec.fromList
                (concatMap
-                (\(a, xs) -> [(a, x) | x <- xs])
+                (concreteTests opts)
                 (view dappUnitTests dapp)))
               1
         , _testPickerDapp = dapp
-        , _testOpts = view uiVmTestOpts s
+        , _testOpts = opts
         }
     Nothing ->
       halt st
@@ -542,14 +555,21 @@ initialUiVmStateForTest
   -> DappInfo
   -> (Text, Text)
   -> UiVmState
-initialUiVmStateForTest opts dapp (theContractName, theTestName) =
+initialUiVmStateForTest opts@UnitTestOptions{..} dapp (theContractName, theTestName) =
   ui1
   where
+    Just typesig = lookup theTestName (unitTestMethods testContract)
+    args = case replay of
+      Nothing -> emptyAbi
+      Just (sig, callData) ->
+        if theTestName == sig
+        then decodeAbiValue (AbiTupleType (Vec.fromList typesig)) callData
+        else emptyAbi
     script = do
       Stepper.evm . pushTrace . EntryTrace $
         "test " <> theTestName <> " (" <> theContractName <> ")"
       initializeUnitTest opts
-      void (runUnitTest opts theTestName)
+      void (runUnitTest opts theTestName args)
     ui0 =
       UiVmState
         { _uiVm             = vm0
@@ -1025,6 +1045,8 @@ opWidget (i, o) = str (showPc i <> " ") <+> case o of
   OpNumber -> txt "NUMBER"
   OpDifficulty -> txt "DIFFICULTY"
   OpGaslimit -> txt "GASLIMIT"
+  OpChainid -> txt "CHAINID"
+  OpSelfbalance -> txt "SELFBALANCE"
   OpPop -> txt "POP"
   OpMload -> txt "MLOAD"
   OpMstore -> txt "MSTORE"
