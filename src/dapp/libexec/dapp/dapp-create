@@ -16,16 +16,25 @@ for i in "$@"; do
   esac
 done
 
+name=${1?missing contract name}
+
 mapfile -t contracts < <(<"$DAPP_JSON" jq '.contracts|keys[]' -r)
 
+name=()
 for path in "${contracts[@]}"; do
-  [[ "${path#*:}" = "$1" ]] && {
-    name="$path"
-    break
-  }
+  [[ "${path#*:}" = "$1" ]] && name+=("$path")
 done
 
-[[ "$name" ]] || exit 1 # not found
+[[ "${#name[@]}" -eq 0 ]] && {
+  echo >&2 "${0##*/}: error: $1 not found"
+  exit 1
+}
+
+[[ "${#name[@]}" -ge 2 ]] && {
+  echo >&2 "${0##*/}: error: $1 found in multiple files"
+  printf '%s\n' "${name[@]}"
+  exit 1
+}
 
 data=$(<"$DAPP_JSON" jq '.contracts' -r)
 contract=$(echo "$data" | jq '.[''"'"$path"'"'']')
