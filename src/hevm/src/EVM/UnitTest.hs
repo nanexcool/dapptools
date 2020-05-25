@@ -126,9 +126,9 @@ initializeUnitTest UnitTestOptions { .. } = do
     env . contracts . ix addr . balance += w256 (testBalanceCreate testParams)
 
   -- Initialize the test contract
-  Stepper.evm (popTrace >> pushTrace (EntryTrace "initialize test"))
   Stepper.evm $
     setupCall testParams addr "setUp()" emptyAbi
+  Stepper.evm (popTrace >> pushTrace (EntryTrace "initialize test"))
 
   Stepper.note "Running `setUp()'"
 
@@ -609,7 +609,7 @@ initialUnitTestVm (UnitTestOptions {..}) theContract _ =
   let
     TestVMParams {..} = testParams
     vm = makeVm $ VMOpts
-           { vmoptCode = view creationCode theContract
+           { vmoptContract = initialContract (InitCode (view creationCode theContract))
            , vmoptCalldata = ""
            , vmoptValue = 0
            , vmoptAddress = testAddress
