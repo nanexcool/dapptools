@@ -1,37 +1,34 @@
 -- Main file of the hevm CLI program
 
-{-# Language BangPatterns #-}
 {-# Language CPP #-}
 {-# Language DataKinds #-}
 {-# Language FlexibleInstances #-}
 {-# Language DeriveGeneric #-}
 {-# Language GADTs #-}
-{-# Language GeneralizedNewtypeDeriving #-}
 {-# Language LambdaCase #-}
 {-# Language NumDecimals #-}
 {-# Language OverloadedStrings #-}
-{-# Language StandaloneDeriving #-}
-{-# Language TemplateHaskell #-}
 {-# Language TypeOperators #-}
 
-import EVM.Concrete (w256)
-
-import qualified EVM as EVM
+import qualified EVM
 import qualified EVM.FeeSchedule as FeeSchedule
 import qualified EVM.Fetch
 import qualified EVM.Flatten
 import qualified EVM.Stepper
-import qualified EVM.TTY as EVM.TTY
-import qualified EVM.Emacs as EVM.Emacs
+import qualified EVM.TTY
+import qualified EVM.Emacs
+
+import Text.ParserCombinators.ReadP
 
 #if MIN_VERSION_aeson(1, 0, 0)
 import qualified EVM.VMTest as VMTest
 #endif
 
 import EVM (ExecMode(..))
-import EVM.Concrete (createAddress)
+import EVM.Concrete (createAddress, w256)
 import EVM.Debug
 import EVM.Exec
+import EVM.ABI
 import EVM.Solidity
 import EVM.Types hiding (word)
 import EVM.UnitTest (UnitTestOptions, coverageReport, coverageForUnitTestContract)
@@ -41,22 +38,22 @@ import EVM.Dapp (findUnitTests, dappInfo)
 import EVM.RLP (rlpdecode)
 import qualified EVM.Patricia as Patricia
 import Data.Map (Map)
+import Numeric (readHex, showHex)
 
 import qualified EVM.Facts     as Facts
 import qualified EVM.Facts.Git as Git
-import qualified EVM.UnitTest  as EVM.UnitTest
+import qualified EVM.UnitTest
 
 import Control.Concurrent.Async   (async, waitCatch)
 import Control.Exception          (evaluate)
 import qualified Control.Monad.Operational as Operational
 import qualified Control.Monad.State.Class as State
 import Control.Lens
-import Control.Applicative
 import Control.Monad              (void, when, forM_)
 import Control.Monad.State.Strict (execState, runState, StateT, liftIO, execStateT)
 import Data.ByteString            (ByteString)
 import Data.List                  (intercalate, isSuffixOf)
-import Data.Text                  (Text, unpack, pack)
+import Data.Text                  (Text, unpack, pack, splitOn)
 import Data.Text.Encoding         (encodeUtf8)
 import Data.Maybe                 (fromMaybe, fromJust)
 import Data.Version               (showVersion)
@@ -67,6 +64,7 @@ import System.Process             (callProcess)
 import qualified Data.Aeson        as JSON
 import qualified Data.Aeson.Types  as JSON
 import Data.Aeson (FromJSON (..), (.:))
+import Data.Aeson.Lens hiding (values)
 import qualified Data.Vector as V
 import qualified Data.ByteString.Lazy  as Lazy
 
@@ -158,6 +156,10 @@ data Command w
   | Rlp  -- RLP decode a string and print the result
   { decode :: w ::: ByteString <?> "RLP encoded hexstring"
   }
+  | Abiencode
+  { abi  :: w ::: String      <?> "Signature of types to decode / encode"
+  , arg  :: w ::: [String]    <?> "Values to encode"
+  }
   | MerkleTest -- Insert a set of key values and check against the given root
   { file :: w ::: String <?> "Path to .json test file"
   }
@@ -195,7 +197,7 @@ unitTestOptions cmd = do
 
   let
     testn = testNumber params
-    block = if (0 ==) testn
+    block = if 0 == testn
        then EVM.Fetch.Latest
        else EVM.Fetch.BlockNumber testn
 
@@ -209,7 +211,7 @@ unitTestOptions cmd = do
     , EVM.UnitTest.fuzzRuns = fromMaybe 100 (fuzzRuns cmd)
     , EVM.UnitTest.replay   = do
         arg <- replay cmd
-        return $ (fst arg, LazyByteString.fromStrict (hexByteString "--replay" $ strip0x $ snd arg))
+        return (fst arg, LazyByteString.fromStrict (hexByteString "--replay" $ strip0x $ snd arg))
     , EVM.UnitTest.vmModifier = vmModifier
     , EVM.UnitTest.testParams = params
     }
@@ -223,6 +225,8 @@ main = do
     Version {} -> putStrLn (showVersion Paths.version)
     Exec {} ->
       launchExec cmd
+    Abiencode {} ->
+      print . ByteStringS $ abiencode (abi cmd) (arg cmd)
     VmTest {} ->
       launchTest ExecuteAsVMTest cmd
     BcTest {} ->
@@ -262,14 +266,14 @@ main = do
       EVM.Emacs.main
     Rlp {} ->
       case rlpdecode $ hexByteString "--decode" $ strip0x $ decode cmd of
-        Nothing -> error("Malformed RLP string")
-        Just c -> putStrLn $ show c
+        Nothing -> error "Malformed RLP string"
+        Just c -> print c
     MerkleTest {} -> merkleTest cmd
     StripMetadata {} -> print .
       ByteStringS . stripBytecodeMetadata . hexByteString "bytecode" . strip0x $ fromJust $ code cmd
 
 launchScript :: String -> Command Options.Unwrapped -> IO ()
-launchScript script cmd = do
+launchScript script cmd =
   withCurrentDirectory (tests cmd) $ do
     dataDir <- Paths.getDataDir
     callProcess "bash"
@@ -302,7 +306,7 @@ findJsonFile Nothing = do
         ]
 
 dappTest :: UnitTestOptions -> Mode -> String -> IO ()
-dappTest opts _ solcFile = do
+dappTest opts _ solcFile =
   readSolc solcFile >>=
     \case
       Just (contractMap, cache) -> do
@@ -325,7 +329,7 @@ regexMatches regexSource =
     Regex.matchTest regex . Seq.fromList . unpack
 
 dappCoverage :: UnitTestOptions -> Mode -> String -> IO ()
-dappCoverage opts _ solcFile = do
+dappCoverage opts _ solcFile =
   readSolc solcFile >>=
     \case
       Just (contractMap, cache) -> do
@@ -371,12 +375,12 @@ launchExec cmd = do
       case view EVM.result vm' of
         Nothing ->
           error "internal error; no EVM result"
-        Just (EVM.VMFailure (EVM.Revert msg)) -> do
+        Just (EVM.VMFailure (EVM.Revert msg)) ->
           die . show . ByteStringS $ msg
-        Just (EVM.VMFailure err) -> do
+        Just (EVM.VMFailure err) ->
           die . show $ err
         Just (EVM.VMSuccess msg) -> do
-          putStrLn . show . ByteStringS $ msg
+          (print . ByteStringS) msg
           case state cmd of
             Nothing -> pure ()
             Just path ->
@@ -394,7 +398,7 @@ parseTups :: JSON.Value -> JSON.Parser [(Text, Maybe Text)]
 parseTups (JSON.Array arr) = do
   tupList <- mapM parseJSON (V.toList arr)
   mapM (\[k, v] -> do
-                  rhs <- parseJSON v <|> empty
+                  rhs <- parseJSON v
                   key <- parseJSON k
                   return (key, rhs))
          tupList
@@ -418,13 +422,13 @@ parseTrieTests = JSON.eitherDecode'
 merkleTest :: Command Options.Unwrapped -> IO ()
 merkleTest cmd = do
   parsed <- parseTrieTests <$> LazyByteString.readFile (file cmd)
-  case parsed of 
+  case parsed of
     Left err -> print err
     Right testcases -> mapM_ runMerkleTest testcases
 
 runMerkleTest :: Testcase -> IO ()
 runMerkleTest (Testcase entries root) = case Patricia.calcRoot entries' of
-                                          Nothing -> error ("Test case failed")
+                                          Nothing -> error "Test case failed"
                                           Just n -> case n == strip0x (hexText root) of
                                             True -> putStrLn "Test case success"
                                             False -> error ("Test case failure; expected "
@@ -484,8 +488,8 @@ vmFromCommand cmd = do
           , EVM.vmoptSchedule      = FeeSchedule.istanbul
           , EVM.vmoptCreate        = create cmd
           }
-        word f def = maybe def id (f cmd)
-        addr f def = maybe def id (f cmd)
+        word f def = fromMaybe def (f cmd)
+        addr f def = fromMaybe def (f cmd)
 
 launchTest :: ExecMode -> Command Options.Unwrapped ->  IO ()
 launchTest execmode cmd = do
@@ -569,3 +573,11 @@ interpret fetcher =
           pure (Left e)
         EVM.Stepper.EVM m ->
           State.state (runState m) >>= interpret fetcher . k
+
+abiencode :: (AsValue s) => s -> [String] -> ByteString
+abiencode abi args =
+  let declarations = parseMethodInput <$> V.toList (abi ^?! key "inputs" . _Array)
+      sig = signature abi
+  in if length declarations == length args
+     then abiMethod sig $ AbiTuple . V.fromList $ zipWith makeAbiValue (snd <$> declarations) args
+     else error $ "wrong number of arguments:" <> show (length args) <> ": " <> show args

@@ -44,12 +44,8 @@ func rawSignHash(data []byte) []byte {
 func getWallets(c *cli.Context, defaultKeyStores cli.StringSlice) []accounts.Wallet {
   backends := []accounts.Backend{}
 
-  var paths []string
-  if len(c.StringSlice("key-store")) == 0 {
-    paths = defaultKeyStores
-  } else {
-    paths = c.StringSlice("key-store")
-  }
+  paths := c.StringSlice("key-store")
+
   for _, x := range(paths) {
     ks := keystore.NewKeyStore(
       x, keystore.StandardScryptN, keystore.StandardScryptP)
@@ -61,13 +57,18 @@ func getWallets(c *cli.Context, defaultKeyStores cli.StringSlice) []accounts.Wal
   } else {
     backends = append(backends, ledgerhub)
   }
-  if trezorhub, err := usbwallet.NewTrezorHub(); err != nil {
-    fmt.Fprintf(os.Stderr, "ethsign: failed to look for USB Trezors")
+  if trezorhub, err := usbwallet.NewTrezorHubWithHID(); err != nil {
+    fmt.Fprintf(os.Stderr, "ethsign: failed to look for USB Trezors (HID)")
+  } else {
+    backends = append(backends, trezorhub)
+  }
+  if trezorhub, err := usbwallet.NewTrezorHubWithWebUSB(); err != nil {
+    fmt.Fprintf(os.Stderr, "ethsign: failed to look for USB Trezors (WebUSD)")
   } else {
     backends = append(backends, trezorhub)
   }
 
-  manager := accounts.NewManager(backends...)
+  manager := accounts.NewManager(&accounts.Config{InsecureUnlockAllowed: false}, backends...)
 
   return manager.Wallets()
 }
@@ -93,8 +94,8 @@ Scan:
       }
     } else if x.URL().Scheme == "ledger" {
       x.Open("")
-      for j := 0; j <= 3; j++ {
-        pathstr := fmt.Sprintf("m/44'/60'/0'/%d", j)
+      for j := 0; j <= c.Int("n"); j++ {
+        pathstr := fmt.Sprintf(c.String("hd-path") + "/%d", j)
         path, _ := accounts.ParseDerivationPath(pathstr)
         y, err := x.Derive(path, true)
         if err != nil {
@@ -161,19 +162,15 @@ func recover(data []byte, sig hexutil.Bytes, noPrefix bool) (common.Address, err
     hash = signHash(data)
   }
 
-  rpk, err := crypto.Ecrecover(hash, sig)
+  rpk, err := crypto.SigToPub(hash, sig)
   if err != nil {
     return common.Address{}, err
   }
-  pubKey, err := crypto.UnmarshalPubkey(rpk)
-  if err != nil {
-    return common.Address{}, fmt.Errorf("invalid public key")
-  }
-  recoveredAddr := crypto.PubkeyToAddress(*pubKey)
-  return recoveredAddr, nil
+  return crypto.PubkeyToAddress(*rpk), nil
 }
 
 func main() {
+  var defaultHDPath = "m/44'/60'/0'" // aka "ledger legacy"
   var defaultKeyStores cli.StringSlice
   if runtime.GOOS == "darwin" {
     defaultKeyStores = []string{
@@ -196,7 +193,7 @@ func main() {
   app := cli.NewApp()
   app.Name = "ethsign"
   app.Usage = "sign Ethereum transactions using a JSON keyfile"
-  app.Version = "0.13"
+  app.Version = "0.15"
   app.Commands = []cli.Command {
     cli.Command {
       Name: "list-accounts",
@@ -207,6 +204,18 @@ func main() {
           Name: "key-store",
           Usage: "path to key store",
           EnvVar: "ETH_KEYSTORE",
+          Value: &defaultKeyStores,
+        },
+        cli.StringFlag{
+          Name: "hd-path",
+          Usage: "hd derivation path",
+          EnvVar: "ETH_HDPATH",
+          Value: defaultHDPath,
+        },
+        cli.IntFlag{
+          Name: "n",
+          Usage: "maximum ledger index",
+          Value: 5,
         },
       },
       Action: func(c *cli.Context) error {
@@ -218,8 +227,8 @@ func main() {
             }
           } else if x.URL().Scheme == "ledger" {
             x.Open("")
-            for j := 0; j <= 3; j++ {
-              pathstr := fmt.Sprintf("m/44'/60'/0'/%d", j)
+            for j := 0; j <= c.Int("n"); j++ {
+              pathstr := fmt.Sprintf(c.String("hd-path") + "/%d", j)
               path, _ := accounts.ParseDerivationPath(pathstr)
               z, err := x.Derive(path, false)
               if err != nil {
@@ -244,6 +253,18 @@ func main() {
           Name: "key-store",
           Usage: "path to key store",
           EnvVar: "ETH_KEYSTORE",
+          Value: &defaultKeyStores,
+        },
+        cli.StringFlag{
+          Name: "hd-path",
+          Usage: "hd derivation path",
+          EnvVar: "ETH_HDPATH",
+          Value: defaultHDPath,
+        },
+        cli.IntFlag{
+          Name: "n",
+          Usage: "maximum ledger index",
+          Value: 5,
         },
         cli.BoolFlag{
           Name: "create",
@@ -363,6 +384,18 @@ func main() {
           Name:   "key-store",
           Usage:  "path to key store",
           EnvVar: "ETH_KEYSTORE",
+          Value: &defaultKeyStores,
+        },
+        cli.StringFlag{
+          Name: "hd-path",
+          Usage: "hd derivation path",
+          EnvVar: "ETH_HDPATH",
+          Value: defaultHDPath,
+        },
+        cli.IntFlag{
+          Name: "n",
+          Usage: "maximum ledger index",
+          Value: 5,
         },
         cli.StringFlag{
           Name:   "from",
@@ -406,13 +439,13 @@ func main() {
           return err
         }
 
-        var hash []byte
+        var msg []byte
         if c.Bool("no-prefix") == true {
-          hash = rawSignHash(data)
+          msg = data 
         } else {
-          hash = signHash(data)
+          msg = []byte(fmt.Sprintf("\x19Ethereum Signed Message:\n%d%s", len(data), data))
         }
-        signature, err := wallet.SignHashWithPassphrase(*acct, passphrase, hash)
+        signature, err := wallet.SignDataWithPassphrase(*acct, passphrase, "", msg)
         if err != nil {
           return cli.NewExitError(err, 1)
         }
@@ -578,7 +611,7 @@ func main() {
           return cli.NewExitError("ethsign: failed to read private key", 1)
         }
 
-	acct, err := ks.ImportECDSA(privatekey, string(passphraseBytes))
+  acct, err := ks.ImportECDSA(privatekey, string(passphraseBytes))
         if err != nil {
           fmt.Fprintf(os.Stderr, "keystore error: %v\n", err)
           return cli.NewExitError("ethsign: failed to import key", 1)

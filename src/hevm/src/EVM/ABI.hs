@@ -25,9 +25,7 @@
 
 -}
 
-{-# Language DeriveAnyClass #-}
 {-# Language StrictData #-}
-{-# Language TemplateHaskell #-}
 
 module EVM.ABI
   ( AbiValue (..)
@@ -47,6 +45,9 @@ module EVM.ABI
   , encodeAbiValue
   , decodeAbiValue
   , parseTypeName
+  , makeAbiValue
+  , parseAbiValue
+  , sig
   ) where
 
 import EVM.Keccak (abiKeccak)
@@ -58,6 +59,7 @@ import Data.Binary.Put    (Put, runPut, putWord8, putWord32be)
 import Data.Bits          (shiftL, shiftR, (.&.))
 import Data.ByteString    (ByteString)
 import Data.DoubleWord    (Word256, Int256, signedWord)
+import Data.Functor       (($>))
 import Data.Monoid        ((<>))
 import Data.Text          (Text, pack)
 import Data.Text.Encoding (encodeUtf8)
@@ -67,11 +69,14 @@ import Data.List          (intercalate)
 import GHC.Generics
 
 import Test.QuickCheck hiding ((.&.), label)
+import Text.ParserCombinators.ReadP
+import Control.Applicative
 
-import qualified Data.ByteString      as BS
-import qualified Data.ByteString.Lazy as BSLazy
-import qualified Data.Text            as Text
-import qualified Data.Vector          as Vector
+import qualified Data.ByteString       as BS
+import qualified Data.ByteString.Char8 as Char8
+import qualified Data.ByteString.Lazy  as BSLazy
+import qualified Data.Text             as Text
+import qualified Data.Vector           as Vector
 
 import qualified Text.Megaparsec      as P
 import qualified Text.Megaparsec.Char as P
@@ -200,7 +205,7 @@ getAbi t = label (Text.unpack (abiTypeSolidity t)) $
 
 putAbi :: AbiValue -> Put
 putAbi = \case
-  AbiUInt _ x -> do
+  AbiUInt _ x ->
     forM_ (reverse [0 .. 7]) $ \i ->
       putWord32be (fromIntegral (shiftR x (i * 32) .&. 0xffffffff))
 
@@ -240,7 +245,7 @@ getAbiHead :: Int -> [AbiType]
   -> Get [Either AbiType AbiValue]
 getAbiHead 0 _      = pure []
 getAbiHead _ []     = fail "ran out of types"
-getAbiHead n (t:ts) = do
+getAbiHead n (t:ts) =
   case abiKind t of
     Dynamic ->
       (Left t :) <$> (skip 32 *> getAbiHead (n - 1) ts)
@@ -324,6 +329,9 @@ encodeAbiValue = BSLazy.toStrict . runPut . putAbi
 decodeAbiValue :: AbiType -> BSLazy.ByteString -> AbiValue
 decodeAbiValue = runGet . getAbi
 
+sig :: Text -> BS.ByteString
+sig s = BSLazy.toStrict . runPut $ putWord32be (abiKeccak (encodeUtf8 s))
+
 abiMethod :: Text -> AbiValue -> BS.ByteString
 abiMethod s args = BSLazy.toStrict . runPut $ do
   putWord32be (abiKeccak (encodeUtf8 s))
@@ -347,7 +355,7 @@ typeWithArraySuffix v = do
         (P.many P.digitChar)
 
   let
-    parseSize :: AbiType -> [Char] -> AbiType
+    parseSize :: AbiType -> String -> AbiType
     parseSize t "" = AbiArrayDynamicType t
     parseSize t s  = AbiArrayType (read s) t
 
@@ -356,16 +364,16 @@ typeWithArraySuffix v = do
 basicType :: Vector AbiType -> P.Parsec () Text AbiType
 basicType v =
   P.choice
-    [ P.string "address" *> pure AbiAddressType
-    , P.string "bool"    *> pure AbiBoolType
-    , P.string "string"  *> pure AbiStringType
+    [ P.string "address" $> AbiAddressType
+    , P.string "bool"    $> AbiBoolType
+    , P.string "string"  $> AbiStringType
 
     , sizedType "uint" AbiUIntType
     , sizedType "int"  AbiIntType
     , sizedType "bytes" AbiBytesType
 
-    , P.string "bytes" *> pure AbiBytesDynamicType
-    , P.string "tuple" *> pure (AbiTupleType v)
+    , P.string "bytes" $> AbiBytesDynamicType
+    , P.string "tuple" $> AbiTupleType v
     ]
 
   where
@@ -430,7 +438,7 @@ genAbiValue = \case
      AbiArray n t . Vector.fromList <$>
        replicateM n (scale (`div` 2) (genAbiValue t))
    AbiTupleType ts ->
-     AbiTuple <$> (sequence . fmap genAbiValue $ ts)
+     AbiTuple <$> mapM genAbiValue ts
   where
     genUInt n =
        do x <- pack8 (div n 8) <$> replicateM n arbitrary
@@ -451,9 +459,9 @@ instance Arbitrary AbiType where
         <$> (getPositive <$> arbitrary)
         <*> scale (`div` 2) arbitrary
     ] <>
-    if n == 0
-    then []
-    else [AbiTupleType <$> scale (`div` 2) (Vector.fromList <$> arbitrary)]
+    [AbiTupleType
+        <$> scale (`div` 2) (Vector.fromList <$> arbitrary)
+        | n /= 0]
 
 instance Arbitrary AbiValue where
   arbitrary = arbitrary >>= genAbiValue
@@ -468,3 +476,53 @@ instance Arbitrary AbiValue where
             (shrinkList shrink (Vector.toList v))
     AbiTuple v -> Vector.toList $ AbiTuple . Vector.fromList . shrink <$> v
     _ -> []
+
+
+-- Bool synonym with custom read instance
+-- to be able to parse lower case 'false' and 'true'
+data Boolz = Boolz Bool
+
+instance Read Boolz where
+  readsPrec _ ('T':'r':'u':'e':x) = [(Boolz True, x)]
+  readsPrec _ ('t':'r':'u':'e':x) = [(Boolz True, x)]
+  readsPrec _ ('f':'a':'l':'s':'e':x) = [(Boolz False, x)]
+  readsPrec _ ('F':'a':'l':'s':'e':x) = [(Boolz False, x)]
+  readsPrec _ [] = []
+  readsPrec n (_:t) = readsPrec n t
+
+makeAbiValue :: AbiType -> String -> AbiValue
+makeAbiValue typ str = case readP_to_S (parseAbiValue typ) str of
+  [] -> error "could not parse abi arguments"
+  ((val,_):_) -> val
+
+parseAbiValue :: AbiType -> ReadP AbiValue
+parseAbiValue (AbiUIntType n) = do W256 w256 <- readS_to_P reads
+                                   return $ AbiUInt n w256
+parseAbiValue (AbiIntType n) = do W256 w256 <- readS_to_P reads
+                                  return $ AbiInt n (num w256)
+parseAbiValue AbiAddressType = AbiAddress <$> readS_to_P reads
+parseAbiValue AbiBoolType = (do W256 w256 <- readS_to_P reads
+                                return $ AbiBool (w256 /= 0))
+                            <|> (do Boolz b <- readS_to_P reads
+                                    return $ AbiBool b)
+parseAbiValue (AbiBytesType n) = AbiBytes n <$> do ByteStringS bytes <- readS_to_P reads
+                                                   return bytes
+parseAbiValue AbiBytesDynamicType = AbiBytesDynamic <$> do ByteStringS bytes <- readS_to_P reads
+                                                           return bytes
+parseAbiValue AbiStringType = AbiString <$> do Char8.pack <$> readS_to_P reads
+parseAbiValue (AbiArrayDynamicType typ) =
+  AbiArrayDynamic typ <$> do a <- listP (parseAbiValue typ)
+                             return $ Vector.fromList a
+parseAbiValue (AbiArrayType n typ) =
+  AbiArray n typ <$> do a <- listP (parseAbiValue typ)
+                        return $ Vector.fromList a
+parseAbiValue (AbiTupleType _) = error "tuple types not supported"
+
+listP :: ReadP a -> ReadP [a]
+listP parser = between (char '[') (char ']') ((do skipSpaces
+                                                  a <- parser
+                                                  skipSpaces
+                                                  return a) `sepBy` (char ','))
+
+
+

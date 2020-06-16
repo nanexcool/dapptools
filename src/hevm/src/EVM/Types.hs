@@ -3,16 +3,18 @@
 
 module EVM.Types where
 
-import Data.Aeson ((.:))
-import Data.Aeson (FromJSON (..))
+import Data.Aeson (FromJSON (..), (.:))
 
 #if MIN_VERSION_aeson(1, 0, 0)
 import Data.Aeson (FromJSONKey (..), FromJSONKeyFunction (..))
 #endif
 
+import Text.ParserCombinators.ReadP
 import Data.Monoid ((<>))
+import Data.Bifunctor (first)
 import Data.Bits
 import Data.Char
+import Data.ByteString.Internal
 import Data.ByteString (ByteString)
 import Data.ByteString.Base16 as BS16
 import Data.ByteString.Builder (byteStringHex, toLazyByteString)
@@ -20,6 +22,7 @@ import Data.ByteString.Lazy (toStrict)
 import qualified Data.ByteString.Char8  as Char8
 import Data.DoubleWord
 import Data.DoubleWord.TH
+import Data.Maybe (fromMaybe)
 import Data.Word (Word8)
 import Numeric (readHex, showHex)
 import Options.Generic
@@ -50,7 +53,7 @@ newtype Addr = Addr { addressWord160 :: Word160 }
 
 instance Read W256 where
   readsPrec _ "0x" = [(0, "")]
-  readsPrec n s = (\(x, r) -> (W256 x, r)) <$> readsPrec n s
+  readsPrec n s = first W256 <$> readsPrec n s
 
 instance Show W256 where
   showsPrec _ s = ("0x" ++) . showHex s
@@ -67,19 +70,21 @@ instance Show Addr where
 showAddrWith0x :: Addr -> String
 showAddrWith0x addr = "0x" ++ show addr
 
-showWordWith0x :: W256 -> String
-showWordWith0x addr = show addr
-
 strip0x :: ByteString -> ByteString
 strip0x bs = if "0x" `Char8.isPrefixOf` bs then Char8.drop 2 bs else bs
 
-newtype ByteStringS = ByteStringS ByteString
+newtype ByteStringS = ByteStringS ByteString deriving (Eq)
 
 instance Show ByteStringS where
   show (ByteStringS x) = ("0x" ++) . Text.unpack . fromBinary $ x
     where
       fromBinary =
         Text.decodeUtf8 . toStrict . toLazyByteString . byteStringHex
+
+instance Read ByteStringS where
+    readsPrec n ('0':'x':x) = [(ByteStringS $ fst bytes, Text.unpack . Text.decodeUtf8 $ snd bytes)]
+       where bytes = BS16.decode (Text.encodeUtf8 (Text.pack x))
+    readsPrec _ _ = []
 
 instance FromJSON W256 where
   parseJSON v = do
@@ -137,9 +142,7 @@ readN :: Integral a => String -> a
 readN s = fromIntegral (read s :: Integer)
 
 readNull :: Read a => a -> String -> a
-readNull x s = case Text.Read.readMaybe s of
-  Just y  -> y
-  Nothing -> x
+readNull x = fromMaybe x . Text.Read.readMaybe
 
 wordField :: JSON.Object -> Text -> JSON.Parser W256
 wordField x f = ((readNull 0) . Text.unpack)
