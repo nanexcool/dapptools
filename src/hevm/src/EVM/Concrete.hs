@@ -3,12 +3,11 @@
 
 module EVM.Concrete where
 
-import Prelude hiding (Word, (^))
+import Prelude hiding (Word)
 
 import EVM.Keccak (keccak)
 import EVM.RLP
-import EVM.Types (Addr, W256 (..), num, toWord512, fromWord512)
-import EVM.Types (word, padRight, word160Bytes, word256Bytes)
+import EVM.Types (Addr, W256 (..), num, word, padRight, word160Bytes, word256Bytes, toWord512, fromWord512)
 
 import Control.Lens    ((^?), ix)
 import Data.Bits       (Bits (..), FiniteBits (..), shiftL, shiftR)
@@ -25,6 +24,7 @@ wordAt i bs =
   word (padRight 32 (BS.drop i bs))
 
 readByteOrZero :: Int -> ByteString -> Word8
+-- This type can give insight into the provenance of a term
 readByteOrZero i bs = fromMaybe 0 (bs ^? ix i)
 
 byteStringSliceWithDefaultZeroes :: Int -> Int -> ByteString -> ByteString
@@ -38,74 +38,19 @@ byteStringSliceWithDefaultZeroes offset size bs =
     let bs' = BS.take size (BS.drop offset bs)
     in bs' <> BS.replicate (size - BS.length bs') 0
 
-data Whiff = Dull | FromKeccak ByteString
+-- This type can give insight into the provenance of a term
+data Whiff = Dull
+           | FromKeccak ByteString
+           | Var String
+           | InfixBinOp String Whiff Whiff
+           | BinOp String Whiff Whiff
+           | UnOp String Whiff
   deriving Show
 
 w256 :: W256 -> Word
 w256 = C Dull
 
-data Word = C Whiff W256
-
-wordToByte :: Word -> Word8
-wordToByte (C _ x) = num (x .&. 0xff)
-
-exponentiate :: Word -> Word -> Word
-exponentiate (C _ x) (C _ y) = w256 (x ^ y)
-
-sdiv :: Word -> Word -> Word
-sdiv _ (C _ (W256 0)) = 0
-sdiv (C _ (W256 x)) (C _ (W256 y)) =
-  let sx = signedWord x
-      sy = signedWord y
-  in w256 . W256 . unsignedWord $ quot sx sy
-
-smod :: Word -> Word -> Word
-smod _ (C _ (W256 0)) = 0
-smod (C _ (W256 x)) (C _ (W256 y)) =
-  let sx = signedWord x
-      sy = signedWord y
-  in w256 . W256 . unsignedWord $ rem sx sy
-
-addmod :: Word -> Word -> Word -> Word
-addmod _ _ (C _ (W256 0)) = 0
-addmod (C _ x) (C _ y) (C _ z) =
-  w256 $
-    fromWord512
-      ((toWord512 x + toWord512 y) `mod` (toWord512 z))
-
-mulmod :: Word -> Word -> Word -> Word
-mulmod _ _ (C _ (W256 0)) = 0
-mulmod (C _ x) (C _ y) (C _ z) =
-  w256 $
-    fromWord512
-      ((toWord512 x * toWord512 y) `mod` (toWord512 z))
-
-slt :: Word -> Word -> Word
-slt (C _ (W256 x)) (C _ (W256 y)) =
-  if signedWord x < signedWord y then w256 1 else w256 0
-
-sgt :: Word -> Word -> Word
-sgt (C _ (W256 x)) (C _ (W256 y)) =
-  if signedWord x > signedWord y then w256 1 else w256 0
-
-shr :: Word -> Word -> Word
-shr x n =
-  if n > 255 then 0
-  else shiftR x (num n)
-
-shl :: Word -> Word -> Word
-shl x n =
-  if n > 255 then 0
-  else shiftL x (num n)
-
-sar :: Word -> Word -> Word
-sar (C _ (W256 x)) (C _ (W256 n)) =
-  let
-    sx = signedWord x
-  in
-    if n > 255 && sx > 0 then 0
-    else if n > 255 && sx < 0 then -1
-    else w256 (num (unsignedWord (shiftR sx (num n))))
+data Word = C Whiff W256 --maybe to remove completely in the future
 
 wordValue :: Word -> W256
 wordValue (C _ x) = x
@@ -170,6 +115,10 @@ keccakBlob x = C (FromKeccak x) (keccak x)
 
 instance Show Word where
   show (C Dull x) = show x
+  show (C (Var var) x) = var ++ ": " ++ show x
+  show (C (InfixBinOp symbol x y) z) = show x ++ symbol ++ show y  ++ ": " ++ show z
+  show (C (BinOp symbol x y) z) = symbol ++ show x ++ show y  ++ ": " ++ show z
+  show (C (UnOp symbol x) z) = symbol ++ show x ++ ": " ++ show z
   show (C whiff x) = show whiff ++ ": " ++ show x
 
 instance Read Word where
@@ -196,6 +145,10 @@ instance FiniteBits Word where
   finiteBitSize (C _ x) = finiteBitSize x
   countLeadingZeros (C _ x) = countLeadingZeros x
   countTrailingZeros (C _ x) = countTrailingZeros x
+
+instance Bounded Word where
+  minBound = w256 minBound
+  maxBound = w256 maxBound
 
 instance Eq Word where
   (C _ x) == (C _ y) = x == y

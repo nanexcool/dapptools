@@ -6,7 +6,6 @@ import EVM.Dapp
 import EVM.Solidity
 import EVM.UnitTest
 
-import qualified EVM
 import qualified EVM.Fetch
 import qualified EVM.TTY
 import qualified EVM.Emacs
@@ -15,8 +14,7 @@ import qualified EVM.Facts.Git as Git
 import qualified EVM.Stepper
 import qualified EVM.VMTest    as VMTest
 
-import Control.Exception          (evaluate)
-import Control.Monad.State.Strict (execState)
+import Control.Monad.State.Strict (execStateT)
 import Data.Text (isPrefixOf)
 
 import qualified Data.Map as Map
@@ -63,12 +61,11 @@ ghciTest root path state =
 
 runBCTest :: (String, VMTest.Case) -> IO Bool
 runBCTest (name, x) = do
-  let vm0 = VMTest.vmForCase EVM.ExecuteAsBlockchainTest x
+  let vm0 = VMTest.vmForCase x
   putStr (name ++ " ")
   result <-
-    evaluate $
-      execState (VMTest.interpret EVM.Stepper.execFully) vm0
-  ok <- VMTest.checkExpectation False EVM.ExecuteAsBlockchainTest x result
+      execStateT (EVM.Stepper.interpret EVM.Fetch.zero EVM.Stepper.execFully) vm0
+  ok <- VMTest.checkExpectation False x result
   putStrLn (if ok then "ok" else "")
   return ok
 

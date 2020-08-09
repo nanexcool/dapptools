@@ -4,6 +4,31 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### Added
+- New commands: 
+  - `seth source <address>` fetches the contract source from etherscan
+  - `seth bundle-source <address>` fetches contract source and compiles to combined json
+  - `seth run-tx <tx-hash> [--debug, --source <file>, --state <repository>]`,
+  set hevm options according to the options given and `hevm exec`
+  - `seth debug <tx-hash> [--no-src]` downloads etherscan source, executes previous txs in block and enters into an hevm interactive session for the given tx. `--no-src` skips the first step.
+  - `seth --{max-uint,max-int,min-int}` print the largest numbers (in hex) of a given bitsize
+  - `seth call --hevm` executes a call via hevm, rather than the RPC
+  - `seth call --debug` executes a call interactively via hevm
+  - `seth --verbose` prints some seth debugging information to stderr
+
+- `seth block` can now be passed the `--full` option, which returns the full block.
+- hexdata can be concatenated with `:`, e.g. '0xaa:0xbb' will be read as '0xaabb'.
+
+### Changed
+- `seth --to-{hex,wei,word,address,dec,int256,ascii,fix,uint256}` and
+  `seth --from-{ascii,wei}` can now read values from stdin.
+- `seth call` now accepts empty calldata and also create transactions
+  via `--create`.
+- `seth --abi-function-json` no longer returns a singleton list, but rather the JSON object it contained.
+- Updated hevm to 0.40
+
 ## [0.9.0] - 2020-05-25
 
 ### Changed

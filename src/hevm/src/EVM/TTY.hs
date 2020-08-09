@@ -1,6 +1,6 @@
 {-# Language TemplateHaskell #-}
 {-# Language ImplicitParams #-}
-
+{-# Language DataKinds #-}
 module EVM.TTY where
 
 import Prelude hiding (Word)
@@ -12,7 +12,7 @@ import Brick.Widgets.List
 
 import EVM
 import EVM.ABI (abiTypeSolidity, decodeAbiValue, AbiType(..), emptyAbi)
-import EVM.Concrete (Word (C))
+import EVM.Symbolic (SymWord(..), maybeLitBytes, Buffer(..))
 import EVM.Dapp (DappInfo, dappInfo)
 import EVM.Dapp (dappUnitTests, unitTestMethods, dappSolcByName, dappSolcByHash, dappSources)
 import EVM.Dapp (dappAstSrcMap)
@@ -44,7 +44,7 @@ import Data.Text (Text, unpack, pack)
 import Data.Text.Encoding (decodeUtf8)
 import Data.List (sort)
 import Data.Version (showVersion)
-import Numeric (showHex)
+import Data.SBV hiding (solver)
 
 import qualified Data.ByteString as BS
 import qualified Data.Map as Map
@@ -74,7 +74,7 @@ type UiWidget = Widget Name
 data UiVmState = UiVmState
   { _uiVm             :: VM
   , _uiVmNextStep     :: Stepper ()
-  , _uiVmStackList    :: List Name (Int, Word)
+  , _uiVmStackList    :: List Name (Int, (SymWord))
   , _uiVmBytecodeList :: List Name (Int, Op)
   , _uiVmTraceList    :: List Name Text
   , _uiVmSolidityList :: List Name (Int, ByteString)
@@ -214,6 +214,11 @@ interpret mode =
                       -- let's do it later.
                       r -> pure r
 
+        -- Stepper is waiting for user input from a query
+        Stepper.Option _ -> do
+                  -- pause & await user.
+                  pure (Stepped (Operational.singleton action >>= k))
+
         -- Stepper wants to make a query and wait for the results?
         Stepper.Wait q ->
           -- Tell the TTY to run an I/O action to produce the next stepper.
@@ -250,8 +255,18 @@ mkVty = do
   V.setMode (V.outputIface vty) V.BracketedPaste True
   return vty
 
-runFromVM :: (Query -> IO (EVM ())) -> VM -> IO VM
-runFromVM oracle' vm = do
+runFromVM :: Maybe (FilePath, FilePath) -> (Query -> IO (EVM ())) -> VM -> IO VM
+runFromVM maybesrcinfo oracle' vm = do
+  uiDappSolc <- case maybesrcinfo of
+                   Nothing -> return Nothing
+                   Just (root,json) -> readSolc json >>= \case
+                     Nothing -> return Nothing
+                     Just (contractMap, sourceCache) ->
+                       let dapp = dappInfo root contractMap sourceCache
+                       in return $ ((,) dapp) <$> (currentSolc dapp vm)
+                           
+                         
+
   let
     opts = UnitTestOptions
       { oracle            = oracle'
@@ -262,7 +277,6 @@ runFromVM oracle' vm = do
       , vmModifier        = id
       , testParams        = error "irrelevant"
       }
-
     ui0 = UiVmState
            { _uiVm = vm
            , _uiVmNextStep = void Stepper.execFully
@@ -270,8 +284,8 @@ runFromVM oracle' vm = do
            , _uiVmBytecodeList = undefined
            , _uiVmTraceList = undefined
            , _uiVmSolidityList = undefined
-           , _uiVmSolc = Nothing
-           , _uiVmDapp = Nothing
+           , _uiVmSolc = snd <$> uiDappSolc
+           , _uiVmDapp = fst <$> uiDappSolc
            , _uiVmStepCount = 0
            , _uiVmFirstState = undefined
            , _uiVmMessage = Just $ "Executing EVM code in " <> show (view (state . contract) vm)
@@ -318,7 +332,6 @@ main opts root jsonFilePath =
             , _testPickerDapp = dapp
             , _testOpts = opts
             }
-
         v <- mkVty
         _ <- customMain v mkVty Nothing (app opts) (ui :: UiState)
         return ()
@@ -446,8 +459,9 @@ appEvent (ViewVm s) (VtyEvent (V.EvKey (V.KChar ' ') [])) =
 
 -- Vm Overview: n - step
 appEvent (ViewVm s) (VtyEvent (V.EvKey (V.KChar 'n') [])) =
-  takeStep s StepNormally StepOne
-
+  case view (uiVm . result) s of
+    Just _ -> continue (ViewVm s)
+    _ -> takeStep s StepNormally StepOne
 
 -- Vm Overview: N - step
 appEvent (ViewVm s) (VtyEvent (V.EvKey (V.KChar 'N') [])) =
@@ -500,6 +514,25 @@ appEvent st@(ViewVm s) (VtyEvent (V.EvKey (V.KChar 'p') [])) =
       -- Take n steps; "timidly," because all queries
       -- ought to be cached.
       takeStep s3 StepTimidly (StepMany (n - 1))
+
+-- Vm Overview: 0 - choose no jump
+appEvent (ViewVm s) (VtyEvent (V.EvKey (V.KChar '0') [])) =
+  case view (uiVm . result) s of
+    Just (VMFailure (Choose (PleaseChoosePath contin))) ->
+      takeStep (s & set uiVm (execState (contin 0) (view uiVm s)))
+        StepNormally
+        StepOne
+    _ -> continue (ViewVm s)
+
+-- Vm Overview: 1 - choose jump
+appEvent (ViewVm s) (VtyEvent (V.EvKey (V.KChar '1') [])) =
+  case view (uiVm . result) s of
+    Just (VMFailure (Choose (PleaseChoosePath contin))) ->
+      takeStep (s & set uiVm (execState (contin 1) (view uiVm s)))
+        StepNormally
+        StepOne
+    _ -> continue (ViewVm s)
+
 
 -- Any: Esc - return to Vm Overview or Exit
 appEvent s (VtyEvent (V.EvKey V.KEsc [])) =
@@ -629,6 +662,8 @@ drawHelpView =
         "C-n    Step fwds to the next source position skipping CALL & CREATE\n" <>
         "p      Step back by one instruction\n\n" <>
         "m      Toggle memory pane\n" <>
+        "0      Choose the branch which does not jump \n" <>
+        "1      Choose the branch which does jump \n" <>
         "Down   Scroll memory pane fwds\n" <>
         "Up     Scroll memory pane back\n" <>
         "C-f    Page memory pane fwds\n" <>
@@ -679,9 +714,11 @@ drawVmBrowser ui =
                   [ txt ("Codehash: " <>    pack (show (view codehash c)))
                   , txt ("Nonce: "    <> showWordExact (view nonce    c))
                   , txt ("Balance: "  <> showWordExact (view balance  c))
-                  , txt ("Storage: "  <> pack ( show ( Map.toList (view storage c))))
+                  , txt ("Storage: "  <> storageDisplay (view storage c))
                   ]
                 ]
+             where storageDisplay (Concrete s) = pack ( show ( Map.toList s))
+                   storageDisplay (Symbolic _) = pack "<symbolic>"
           Just solc ->
             hBox
               [ borderWithLabel (txt "Contract information") . padBottom Max . padRight (Pad 2) $ vBox
@@ -770,27 +807,29 @@ isNextSourcePosition ui vm =
 isNextSourcePositionWithoutEntering
   :: UiVmState -> Pred VM
 isNextSourcePositionWithoutEntering ui vm =
-  let
-    vm0             = view uiVm ui
-    Just dapp       = view uiVmDapp ui
-    initialPosition = currentSrcMap dapp vm0
-    initialHeight   = length (view frames vm0)
-  in
-    case currentSrcMap dapp vm of
-      Nothing ->
-        True
-      Just here ->
-        let
-          moved = Just here /= initialPosition
-          deeper = length (view frames vm) > initialHeight
-          boring =
-            case srcMapCode (view dappSources dapp) here of
-              Just bs ->
-                BS.isPrefixOf "contract " bs
-              Nothing ->
-                True
-        in
-           moved && not deeper && not boring
+  case view uiVmDapp ui of
+    Nothing -> True
+    Just dapp ->
+      let
+        vm0             = view uiVm ui
+        initialPosition = currentSrcMap dapp vm0
+        initialHeight   = length (view frames vm0)
+      in
+        case currentSrcMap dapp vm of
+          Nothing ->
+            True
+          Just here ->
+            let
+              moved = Just here /= initialPosition
+              deeper = length (view frames vm) > initialHeight
+              boring =
+                case srcMapCode (view dappSources dapp) here of
+                  Just bs ->
+                    BS.isPrefixOf "contract " bs
+                  Nothing ->
+                    True
+            in
+               moved && not deeper && not boring
 
 isExecutionHalted :: UiVmState -> Pred VM
 isExecutionHalted _ vm = isJust (view result vm)
@@ -829,13 +868,13 @@ updateUiVmState ui vm =
     message =
       case view result vm of
         Just (VMSuccess msg) ->
-          Just ("VMSuccess: " <> (show . ByteStringS $ msg))
+          Just ("VMSuccess: " <> (show msg))
         Just (VMFailure (Revert msg)) ->
           Just ("VMFailure: " <> (show . ByteStringS $ msg))
         Just (VMFailure err) ->
           Just ("VMFailure: " <> show err)
         Nothing ->
-          Just ("Executing EVM code in " <> showAddrWith0x address)
+          Just ("Executing EVM code in " <> show address)
     ui' = ui
       & set uiVm vm
       & set uiVmStackList
@@ -879,11 +918,13 @@ drawStackPane ui =
     labelText = txt ("Gas available: " <> gasText <> "; stack:")
   in hBorderWithLabel labelText <=>
     renderList
-      (\_ (i, x@(C _ w)) ->
+      (\_ (i, x@(S _ w)) ->
          vBox
            [ withHighlight True (str ("#" ++ show i ++ " "))
                <+> str (show x)
-           , dim (txt ("   " <> showWordExplanation w (view uiVmDapp ui)))
+           , dim (txt ("   " <> case unliteral w of
+                       Nothing -> ""
+                       Just u -> showWordExplanation (fromSizzle u) (view uiVmDapp ui)))
            ])
       False
       (view uiVmStackList ui)
@@ -917,17 +958,25 @@ withHighlight :: Bool -> Widget n -> Widget n
 withHighlight False = withDefAttr dimAttr
 withHighlight True  = withDefAttr boldAttr
 
+prettyIfConcrete :: Buffer -> String
+prettyIfConcrete (SymbolicBuffer x) = show x
+prettyIfConcrete (ConcreteBuffer x) = prettyHex 40 x
+
 drawTracePane :: UiVmState -> UiWidget
 drawTracePane s =
   case view uiVmShowMemory s of
     True ->
       hBorderWithLabel (txt "Calldata")
-      <=> str (prettyHex 40 (view (uiVm . state . calldata) s))
+      <=> str (prettyIfConcrete $ fst (view (uiVm . state . calldata) s))
       <=> hBorderWithLabel (txt "Returndata")
-      <=> str (prettyHex 40 (view (uiVm . state . returndata) s))
+      <=> str (prettyIfConcrete (view (uiVm . state . returndata) s))
+      <=> hBorderWithLabel (txt "Output")
+      <=> str (maybe "" show (view (uiVm . result) s))
+      <=> hBorderWithLabel (txt "Cache")
+      <=> str (show (view (uiVm . cache . path) s))
       <=> hBorderWithLabel (txt "Memory")
       <=> viewport TracePane Vertical
-            (str (prettyHex 40 (view (uiVm . state . memory) s)))
+            (str (prettyIfConcrete (view (uiVm . state . memory) s)))
     False ->
       hBorderWithLabel (txt "Trace")
       <=> renderList
@@ -991,91 +1040,8 @@ ifTallEnough need w1 w2 =
       then render w1
       else render w2
 
-showPc :: (Integral a, Show a) => a -> String
-showPc x =
-  if x < 0x10
-  then '0' : showHex x ""
-  else showHex x ""
-
 opWidget :: (Integral a, Show a) => (a, Op) -> Widget n
-opWidget (i, o) = str (showPc i <> " ") <+> case o of
-  OpStop -> txt "STOP"
-  OpAdd -> txt "ADD"
-  OpMul -> txt "MUL"
-  OpSub -> txt "SUB"
-  OpDiv -> txt "DIV"
-  OpSdiv -> txt "SDIV"
-  OpMod -> txt "MOD"
-  OpSmod -> txt "SMOD"
-  OpAddmod -> txt "ADDMOD"
-  OpMulmod -> txt "MULMOD"
-  OpExp -> txt "EXP"
-  OpSignextend -> txt "SIGNEXTEND"
-  OpLt -> txt "LT"
-  OpGt -> txt "GT"
-  OpSlt -> txt "SLT"
-  OpSgt -> txt "SGT"
-  OpEq -> txt "EQ"
-  OpIszero -> txt "ISZERO"
-  OpAnd -> txt "AND"
-  OpOr -> txt "OR"
-  OpXor -> txt "XOR"
-  OpNot -> txt "NOT"
-  OpByte -> txt "BYTE"
-  OpShl -> txt "SHL"
-  OpShr -> txt "SHR"
-  OpSar -> txt "SAR"
-  OpSha3 -> txt "SHA3"
-  OpAddress -> txt "ADDRESS"
-  OpBalance -> txt "BALANCE"
-  OpOrigin -> txt "ORIGIN"
-  OpCaller -> txt "CALLER"
-  OpCallvalue -> txt "CALLVALUE"
-  OpCalldataload -> txt "CALLDATALOAD"
-  OpCalldatasize -> txt "CALLDATASIZE"
-  OpCalldatacopy -> txt "CALLDATACOPY"
-  OpCodesize -> txt "CODESIZE"
-  OpCodecopy -> txt "CODECOPY"
-  OpGasprice -> txt "GASPRICE"
-  OpExtcodesize -> txt "EXTCODESIZE"
-  OpExtcodecopy -> txt "EXTCODECOPY"
-  OpReturndatasize -> txt "RETURNDATASIZE"
-  OpReturndatacopy -> txt "RETURNDATACOPY"
-  OpExtcodehash -> txt "EXTCODEHASH"
-  OpBlockhash -> txt "BLOCKHASH"
-  OpCoinbase -> txt "COINBASE"
-  OpTimestamp -> txt "TIMESTAMP"
-  OpNumber -> txt "NUMBER"
-  OpDifficulty -> txt "DIFFICULTY"
-  OpGaslimit -> txt "GASLIMIT"
-  OpChainid -> txt "CHAINID"
-  OpSelfbalance -> txt "SELFBALANCE"
-  OpPop -> txt "POP"
-  OpMload -> txt "MLOAD"
-  OpMstore -> txt "MSTORE"
-  OpMstore8 -> txt "MSTORE8"
-  OpSload -> txt "SLOAD"
-  OpSstore -> txt "SSTORE"
-  OpJump -> txt "JUMP"
-  OpJumpi -> txt "JUMPI"
-  OpPc -> txt "PC"
-  OpMsize -> txt "MSIZE"
-  OpGas -> txt "GAS"
-  OpJumpdest -> txt "JUMPDEST"
-  OpCreate -> txt "CREATE"
-  OpCall -> txt "CALL"
-  OpStaticcall -> txt "STATICCALL"
-  OpCallcode -> txt "CALLCODE"
-  OpReturn -> txt "RETURN"
-  OpDelegatecall -> txt "DELEGATECALL"
-  OpCreate2 -> txt "CREATE2"
-  OpSelfdestruct -> txt "SELFDESTRUCT"
-  OpDup x -> txt "DUP" <+> str (show x)
-  OpSwap x -> txt "SWAP" <+> str (show x)
-  OpLog x -> txt "LOG" <+> str (show x)
-  OpPush x -> txt "PUSH " <+> withDefAttr wordAttr (str (show x))
-  OpRevert -> txt "REVERT"
-  OpUnknown x -> txt "UNKNOWN " <+> str (show x)
+opWidget = txt . pack . opString
 
 selectedAttr :: AttrName; selectedAttr = "selected"
 dimAttr :: AttrName; dimAttr = "dim"

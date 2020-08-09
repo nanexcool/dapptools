@@ -1,10 +1,10 @@
 { lib, stdenv, fetchFromGitHub, makeWrapper, glibcLocales
 , coreutils, git, gnused, gnumake, hevm, jshon, jq, nix
-, nodejs, perl, seth , shellcheck , solc }:
+, nodejs, perl, seth, shellcheck, solc, dapptoolsSrc }:
 
 stdenv.mkDerivation rec {
   name = "dapp-${version}";
-  version = "0.27.0";
+  version = "0.28.0";
   src = ./.;
 
   nativeBuildInputs = [makeWrapper shellcheck coreutils nodejs];
@@ -22,6 +22,7 @@ stdenv.mkDerivation rec {
       ''
         wrapProgram "$out/bin/dapp" \
           --prefix PATH : ${path} \
+          --set DAPPTOOLS ${dapptoolsSrc} \
         ${lib.optionalString (glibcLocales != null) ''
           --set LOCALE_ARCHIVE ${glibcLocales}/lib/locale/locale-archive
       ''}

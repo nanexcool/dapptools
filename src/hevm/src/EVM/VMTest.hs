@@ -9,30 +9,21 @@ module EVM.VMTest
 #endif
   , vmForCase
   , checkExpectation
-  , interpret
   ) where
 
 import qualified EVM
 import qualified EVM.Concrete as EVM
-import qualified EVM.Exec
 import qualified EVM.FeeSchedule
-import qualified EVM.Stepper as Stepper
-import qualified EVM.Fetch as Fetch
 
-import Control.Monad.State.Strict (runState, join)
-import qualified Control.Monad.Operational as Operational
-import qualified Control.Monad.State.Class as State
-
-import EVM (EVM)
-import EVM.Stepper (Stepper)
+import EVM.Symbolic
 import EVM.Transaction
 import EVM.Types
+
+import Data.SBV
 
 import Control.Arrow ((***), (&&&))
 import Control.Lens
 import Control.Monad
-
-import IPPrint.Colored (cpprint)
 
 import Data.ByteString (ByteString)
 import Data.Aeson ((.:), (.:?), FromJSON (..))
@@ -46,6 +37,7 @@ import qualified Data.Map          as Map
 import qualified Data.Aeson        as JSON
 import qualified Data.Aeson.Types  as JSON
 import qualified Data.ByteString.Lazy  as Lazy
+import qualified Data.ByteString as BS
 
 data Which = Pre | Post
 
@@ -113,7 +105,7 @@ checkStateFail diff x expectation vm (okState, okMoney, okNonce, okData, okCode)
   let
     printField :: (v -> String) -> Map Addr v -> IO ()
     printField f d = putStrLn $ Map.foldrWithKey (\k v acc ->
-      acc ++ showAddrWith0x k ++ " : " ++ f v ++ "\n") "" d
+      acc ++ show k ++ " : " ++ f v ++ "\n") "" d
 
     reason = map fst (filter (not . snd)
         [ ("bad-state",       okMoney || okNonce || okData  || okCode || okState)
@@ -125,7 +117,9 @@ checkStateFail diff x expectation vm (okState, okMoney, okNonce, okData, okCode)
     check = checkContracts x
     initial = initTx x
     expected = expectedContracts expectation
-    actual = view (EVM.env . EVM.contracts . to (fmap clearZeroStorage)) vm
+    actual = view (EVM.env . EVM.contracts . to (fmap (clearZeroStorage.clearOrigStorage))) vm
+    printStorage (EVM.Symbolic c) = show c
+    printStorage (EVM.Concrete c) = show $ Map.toList c
 
   putStr (unwords reason)
   when (diff && (not okState)) $ do
@@ -144,13 +138,13 @@ checkStateFail diff x expectation vm (okState, okMoney, okNonce, okData, okCode)
     putStrLn "\nActual balance/state: "
     printField (\v -> (show . toInteger  $ EVM._nonce v) ++ " "
                    ++ (show . toInteger  $ EVM._balance v) ++ " "
-                   ++ (show . Map.toList $ EVM._storage v)) actual
+                   ++ (printStorage      $ EVM._storage v)) actual
   return okState
 
-checkExpectation :: Bool -> EVM.ExecMode -> Case -> EVM.VM -> IO Bool
-checkExpectation diff execmode x vm =
-  case (execmode, testExpectation x, view EVM.result vm) of
-    (EVM.ExecuteAsBlockchainTest, Just expectation, _) -> do
+checkExpectation :: Bool -> Case -> EVM.VM -> IO Bool
+checkExpectation diff x vm =
+  case (testExpectation x, view EVM.result vm) of
+    (Just expectation, _) -> do
       let (okState, b2, b3, b4, b5) =
             checkExpectedContracts vm (expectedContracts expectation)
       _ <- if not okState then
@@ -159,40 +153,16 @@ checkExpectation diff execmode x vm =
            else return True
       return okState
 
-    (_, Just expectation, Just (EVM.VMSuccess output)) -> do
-      let
-        (okState, ok2, ok3, ok4, ok5) =
-          checkExpectedContracts vm (expectedContracts expectation)
-        (s2, b2) = ("bad-output", checkExpectedOut output (expectedOut expectation))
-        (s3, b3) = ("bad-gas", checkExpectedGas vm (expectedGas expectation))
-        ss = map fst (filter (not . snd) [(s2, b2), (s3, b3)])
-      _ <- if not okState then
-               checkStateFail
-                    diff x expectation vm (okState, ok2, ok3, ok4, ok5)
-               else
-                   return True
-      putStr (unwords ss)
-      return (okState && b2 && b3)
-
-    (_, Nothing, Just (EVM.VMSuccess _)) -> do
+    (Nothing, Just (EVM.VMSuccess _)) -> do
       putStr "unexpected-success"
       return False
 
-    (_, Nothing, Just (EVM.VMFailure _)) ->
+    (Nothing, Just (EVM.VMFailure _)) ->
       return True
 
-    (_, Just _, Just (EVM.VMFailure _)) -> do
-      putStr "unexpected-failure"
-      return False
-
-    (_, _, Nothing) -> do
-      cpprint (view EVM.result vm)
+    (_, Nothing) -> do
+      print (view EVM.result vm)
       error "internal error"
-
-checkExpectedOut :: ByteString -> Maybe ByteString -> Bool
-checkExpectedOut output ex = case ex of
-  Nothing       -> True
-  Just expected -> output == expected
 
 -- quotient account state by nullness
 (~=) :: Map Addr EVM.Contract -> Map Addr EVM.Contract -> Bool
@@ -205,8 +175,8 @@ checkExpectedOut output ex = case ex of
 
 checkExpectedContracts :: EVM.VM -> Map Addr Contract -> (Bool, Bool, Bool, Bool, Bool)
 checkExpectedContracts vm expected =
-  let cs = vm ^. EVM.env . EVM.contracts . to (fmap clearZeroStorage)
-      expectedCs = realizeContracts expected
+  let cs = vm ^. EVM.env . EVM.contracts . to (fmap (clearZeroStorage.clearOrigStorage))
+      expectedCs = clearOrigStorage <$> realizeContracts expected
   in ( (expectedCs ~= cs)
      , (clearBalance <$> expectedCs) ~= (clearBalance <$> cs)
      , (clearNonce   <$> expectedCs) ~= (clearNonce   <$> cs)
@@ -214,12 +184,17 @@ checkExpectedContracts vm expected =
      , (clearCode    <$> expectedCs) ~= (clearCode    <$> cs)
      )
 
+clearOrigStorage :: EVM.Contract -> EVM.Contract
+clearOrigStorage = set EVM.origStorage mempty
+
 clearZeroStorage :: EVM.Contract -> EVM.Contract
-clearZeroStorage =
-  over EVM.storage (Map.filterWithKey (\_ x -> x /= 0))
+clearZeroStorage c = case EVM._storage c of
+  EVM.Symbolic _ -> c
+  EVM.Concrete m -> let store = Map.filter (\x -> forceLit x /= 0) m
+                    in set EVM.storage (EVM.Concrete store) c
 
 clearStorage :: EVM.Contract -> EVM.Contract
-clearStorage = set EVM.storage mempty
+clearStorage = set EVM.storage (EVM.Concrete mempty)
 
 clearBalance :: EVM.Contract -> EVM.Contract
 clearBalance = set EVM.balance 0
@@ -229,13 +204,6 @@ clearNonce = set EVM.nonce 0
 
 clearCode :: EVM.Contract -> EVM.Contract
 clearCode = set EVM.contractcode (EVM.RuntimeCode mempty)
-
-checkExpectedGas :: EVM.VM -> Maybe W256 -> Bool
-checkExpectedGas vm ex = case ex of
-  Nothing -> True
-  Just expected -> case vm ^. EVM.state . EVM.gas of
-    EVM.C _ x | x == expected -> True
-    _ -> False
 
 #if MIN_VERSION_aeson(1, 0, 0)
 
@@ -287,10 +255,10 @@ parseVmOpts v =
        (JSON.Object env, JSON.Object exec) ->
          EVM.VMOpts
            <$> (dataField exec "code" >>= pure . EVM.initialContract . EVM.RuntimeCode)
-           <*> dataField exec "data"
-           <*> wordField exec "value"
+           <*> (dataField exec "data" >>= \a -> pure ( (ConcreteBuffer a), literal . num $ BS.length a))
+           <*> (w256lit <$> wordField exec "value")
            <*> addrField exec "address"
-           <*> addrField exec "caller"
+           <*> (litAddr <$> addrField exec "caller")
            <*> addrField exec "origin"
            <*> wordField exec "gas" -- XXX: correct?
            <*> wordField exec "gas" -- XXX: correct?
@@ -301,7 +269,8 @@ parseVmOpts v =
            <*> pure 0xffffffff
            <*> wordField env  "currentGasLimit"
            <*> wordField exec "gasPrice"
-           <*> pure (EVM.FeeSchedule.homestead)
+           <*> pure (EVM.FeeSchedule.istanbul)
+           <*> pure 1
            <*> pure False
        _ ->
          JSON.typeMismatch "VM test case" (JSON.Object v)
@@ -355,7 +324,12 @@ realizeContract x =
   EVM.initialContract (x ^. code)
     & EVM.balance .~ EVM.w256 (x ^. balance)
     & EVM.nonce   .~ EVM.w256 (x ^. nonce)
-    & EVM.storage .~ (
+    & EVM.storage .~ EVM.Concrete (
+        Map.fromList .
+        map (bimap EVM.w256 (litWord . EVM.w256)) .
+        Map.toList $ x ^. storage
+        )
+    & EVM.origStorage .~ (
         Map.fromList .
         map (bimap EVM.w256 EVM.w256) .
         Map.toList $ x ^. storage
@@ -405,10 +379,10 @@ fromCreateBlockchainCase block tx preState postState =
       in Right $ Case
          (EVM.VMOpts
           { vmoptContract      = EVM.initialContract (EVM.InitCode (txData tx))
-          , vmoptCalldata      = mempty
-          , vmoptValue         = txValue tx
+          , vmoptCalldata      = (mempty, 0)
+          , vmoptValue         = w256lit $ txValue tx
           , vmoptAddress       = createdAddr
-          , vmoptCaller        = origin
+          , vmoptCaller        = (litAddr origin)
           , vmoptOrigin        = origin
           , vmoptGas           = txGasLimit tx - fromIntegral (txGasCost feeSchedule tx)
           , vmoptGaslimit      = txGasLimit tx
@@ -420,6 +394,7 @@ fromCreateBlockchainCase block tx preState postState =
           , vmoptBlockGaslimit = blockGasLimit block
           , vmoptGasprice      = txGasPrice tx
           , vmoptSchedule      = feeSchedule
+          , vmoptChainId       = 1
           , vmoptCreate        = True
           })
         checkState
@@ -442,10 +417,10 @@ fromNormalBlockchainCase block tx preState postState =
       (_, _, Just origin, Just checkState) -> Right $ Case
         (EVM.VMOpts
          { vmoptContract      = EVM.initialContract theCode
-         , vmoptCalldata      = txData tx
-         , vmoptValue         = txValue tx
+         , vmoptCalldata      = (ConcreteBuffer $ txData tx, literal . num . BS.length $ txData tx)
+         , vmoptValue         = litWord (EVM.w256 $ txValue tx)
          , vmoptAddress       = toAddr
-         , vmoptCaller        = origin
+         , vmoptCaller        = (litAddr origin)
          , vmoptOrigin        = origin
          , vmoptGas           = txGasLimit tx - fromIntegral (txGasCost feeSchedule tx)
          , vmoptGaslimit      = txGasLimit tx
@@ -457,6 +432,7 @@ fromNormalBlockchainCase block tx preState postState =
          , vmoptBlockGaslimit = blockGasLimit block
          , vmoptGasprice      = txGasPrice tx
          , vmoptSchedule      = feeSchedule
+         , vmoptChainId       = 1
          , vmoptCreate        = False
          })
         checkState
@@ -518,8 +494,8 @@ initTx x =
     initcode = EVM._contractcode (EVM.vmoptContract opts)
     creation = EVM.vmoptCreate   opts
   in
-    (Map.adjust (over balance (subtract value)) origin)
-    . (Map.adjust (over balance (+ value)) toAddr)
+    (Map.adjust (over balance (subtract (EVM.wordValue $ forceLit value))) origin)
+    . (Map.adjust (over balance (+ (EVM.wordValue $ forceLit value))) toAddr)
     . (if creation
        then (Map.adjust (set code initcode) toAddr)
           . (Map.adjust (set nonce 1) toAddr)
@@ -528,15 +504,11 @@ initTx x =
        else id)
     $ checkState
 
-vmForCase :: EVM.ExecMode -> Case -> EVM.VM
-vmForCase mode x =
+vmForCase :: Case -> EVM.VM
+vmForCase x =
   let
     checkState = checkContracts x
-    initState =
-      case mode of
-        EVM.ExecuteAsBlockchainTest -> initTx x
-        EVM.ExecuteAsVMTest         -> checkState
-        EVM.ExecuteNormally         -> error "cannot initialize VM normally"
+    initState = initTx x
     opts = testVmOpts x
     creation = EVM.vmoptCreate opts
     touchedAccounts =
@@ -548,32 +520,4 @@ vmForCase mode x =
     EVM.makeVm (testVmOpts x)
     & EVM.env . EVM.contracts .~ realizeContracts initState
     & EVM.tx . EVM.txReversion .~ realizeContracts checkState
-    & EVM.tx . EVM.origStorage .~ realizeContracts initState
     & EVM.tx . EVM.substate . EVM.touchedAccounts .~ touchedAccounts
-    & EVM.execMode .~ mode
-
-interpret :: Stepper a -> EVM a
-interpret =
-  eval . Operational.view
-
-  where
-    eval
-      :: Operational.ProgramView Stepper.Action a
-      -> EVM a
-
-    eval (Operational.Return x) =
-      pure x
-
-    eval (action Operational.:>>= k) =
-      case action of
-        Stepper.Exec ->
-          EVM.Exec.exec >>= interpret . k
-        Stepper.Wait q ->
-          do join (Fetch.zero q)
-             interpret (k ())
-        Stepper.Note _ ->
-          interpret (k ())
-        Stepper.Fail _ ->
-          error "VMTest stepper not supposed to fail"
-        Stepper.EVM m ->
-          State.state (runState m) >>= interpret . k

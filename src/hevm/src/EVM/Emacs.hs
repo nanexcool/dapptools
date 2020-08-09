@@ -1,5 +1,6 @@
 {-# Language ImplicitParams #-}
 {-# Language TemplateHaskell #-}
+{-# Language DataKinds #-}
 {-# Language FlexibleInstances #-}
 
 module EVM.Emacs where
@@ -17,23 +18,24 @@ import Data.SCargot.Repr
 import Data.SCargot.Repr.Basic
 import Data.Set (Set)
 import Data.Text (Text, pack, unpack)
+import Data.SBV hiding (Word, output)
 import EVM
 import EVM.ABI
 import EVM.Concrete
+import EVM.Symbolic
 import EVM.Dapp
 import EVM.Debug (srcMapCodePos)
 import EVM.Fetch (Fetcher)
 import EVM.Op
 import EVM.Solidity
 import EVM.Stepper (Stepper)
-import EVM.TTY (currentSrcMap, showPc)
+import EVM.TTY (currentSrcMap)
 import EVM.Types
-import EVM.UnitTest hiding (interpret)
+import EVM.UnitTest
 import Prelude hiding (Word)
 import System.Directory
 import System.IO
 import qualified Control.Monad.Operational as Operational
-import qualified Data.ByteString as BS
 import qualified Data.List as List
 import qualified Data.Map as Map
 import qualified Data.Set as Set
@@ -426,6 +428,10 @@ instance SDisplay DappInfo where
 instance SDisplay (SExpr Text) where
   sexp = id
 
+instance SDisplay Storage where
+  sexp (Symbolic _) = error "idk"
+  sexp (Concrete d) = sexp d
+
 instance SDisplay VM where
   sexp x =
     L [ L [A "result", sexp (view result x)]
@@ -438,7 +444,7 @@ quoted :: Text -> Text
 quoted x = "\"" <> x <> "\""
 
 instance SDisplay Addr where
-  sexp = A . quoted . pack . showAddrWith0x
+  sexp = A . quoted . pack . show
 
 instance SDisplay Contract where
   sexp x =
@@ -450,6 +456,23 @@ instance SDisplay Contract where
 
 instance SDisplay W256 where
   sexp x = A (txt (txt x))
+
+-- no idea what's going on here
+instance SDisplay (SWord 256) where
+  sexp x = A (txt (txt x))
+
+-- no idea what's going on here
+instance SDisplay (SymWord) where
+  sexp x = A (txt (txt x))
+
+-- no idea what's going on here
+instance SDisplay (SWord 8) where
+  sexp x = A (txt (txt x))
+
+-- no idea what's going on here
+instance SDisplay Buffer where
+  sexp (SymbolicBuffer x) = sexp x
+  sexp (ConcreteBuffer x) = sexp x
 
 instance (SDisplay k, SDisplay v) => SDisplay (Map k v) where
   sexp x = L [L [sexp k, sexp v] | (k, v) <- Map.toList x]
@@ -487,17 +510,17 @@ instance {-# OVERLAPPING #-} SDisplay String where
   sexp x = A (txt x)
 
 instance SDisplay Word where
-  sexp (C Dull x) = A (quoted (txt x))
   sexp (C (FromKeccak bs) x) =
     L [A "hash", A (txt x), sexp bs]
+  sexp (C _ x) = A (quoted (txt x))
 
 instance SDisplay ByteString where
   sexp = A . txt . pack . show . ByteStringS
 
-sexpMemory :: ByteString -> SExpr Text
+sexpMemory :: Buffer -> SExpr Text
 sexpMemory bs =
-  if BS.length bs > 1024
-  then L [A "large-memory", A (txt (BS.length bs))]
+  if len bs > 1024
+  then L [A "large-memory", A (txt (len bs))]
   else sexp bs
 
 defaultUnitTestOptions :: MonadIO m => m UnitTestOptions
@@ -544,83 +567,3 @@ initialStateForTest opts@(UnitTestOptions {..}) dapp (contractPath, testName) =
       initialUnitTestVm opts testContract (Map.elems (view dappSolcByName dapp))
     ui1 =
       updateUiVmState ui0 vm0 & set uiVmFirstState ui1
-
-opString :: (Integral a, Show a) => (a, Op) -> String
-opString (i, o) = (showPc i <> " ") ++ case o of
-  OpStop -> "STOP"
-  OpAdd -> "ADD"
-  OpMul -> "MUL"
-  OpSub -> "SUB"
-  OpDiv -> "DIV"
-  OpSdiv -> "SDIV"
-  OpMod -> "MOD"
-  OpSmod -> "SMOD"
-  OpAddmod -> "ADDMOD"
-  OpMulmod -> "MULMOD"
-  OpExp -> "EXP"
-  OpSignextend -> "SIGNEXTEND"
-  OpLt -> "LT"
-  OpGt -> "GT"
-  OpSlt -> "SLT"
-  OpSgt -> "SGT"
-  OpEq -> "EQ"
-  OpIszero -> "ISZERO"
-  OpAnd -> "AND"
-  OpOr -> "OR"
-  OpXor -> "XOR"
-  OpNot -> "NOT"
-  OpByte -> "BYTE"
-  OpShl -> "SHL"
-  OpShr -> "SHR"
-  OpSar -> "SAR"
-  OpSha3 -> "SHA3"
-  OpAddress -> "ADDRESS"
-  OpBalance -> "BALANCE"
-  OpOrigin -> "ORIGIN"
-  OpCaller -> "CALLER"
-  OpCallvalue -> "CALLVALUE"
-  OpCalldataload -> "CALLDATALOAD"
-  OpCalldatasize -> "CALLDATASIZE"
-  OpCalldatacopy -> "CALLDATACOPY"
-  OpCodesize -> "CODESIZE"
-  OpCodecopy -> "CODECOPY"
-  OpGasprice -> "GASPRICE"
-  OpExtcodesize -> "EXTCODESIZE"
-  OpExtcodecopy -> "EXTCODECOPY"
-  OpReturndatasize -> "RETURNDATASIZE"
-  OpReturndatacopy -> "RETURNDATACOPY"
-  OpExtcodehash -> "EXTCODEHASH"
-  OpBlockhash -> "BLOCKHASH"
-  OpCoinbase -> "COINBASE"
-  OpTimestamp -> "TIMESTAMP"
-  OpNumber -> "NUMBER"
-  OpDifficulty -> "DIFFICULTY"
-  OpGaslimit -> "GASLIMIT"
-  OpChainid -> "CHAINID"
-  OpSelfbalance -> "SELFBALANCE"
-  OpPop -> "POP"
-  OpMload -> "MLOAD"
-  OpMstore -> "MSTORE"
-  OpMstore8 -> "MSTORE8"
-  OpSload -> "SLOAD"
-  OpSstore -> "SSTORE"
-  OpJump -> "JUMP"
-  OpJumpi -> "JUMPI"
-  OpPc -> "PC"
-  OpMsize -> "MSIZE"
-  OpGas -> "GAS"
-  OpJumpdest -> "JUMPDEST"
-  OpCreate -> "CREATE"
-  OpCall -> "CALL"
-  OpStaticcall -> "STATICCALL"
-  OpCallcode -> "CALLCODE"
-  OpReturn -> "RETURN"
-  OpDelegatecall -> "DELEGATECALL"
-  OpCreate2 -> "CREATE2"
-  OpSelfdestruct -> "SELFDESTRUCT"
-  OpDup x -> "DUP" ++ show x
-  OpSwap x -> "SWAP" ++ show x
-  OpLog x -> "LOG" ++ show x
-  OpPush x -> "PUSH " ++ show x
-  OpRevert -> "REVERT"
-  OpUnknown x -> "UNKNOWN " ++ show x

@@ -1,6 +1,7 @@
 {-# Language ImplicitParams #-}
 {-# Language ConstraintKinds #-}
 {-# Language FlexibleInstances #-}
+{-# Language DataKinds #-}
 {-# Language GADTs #-}
 {-# Language RecordWildCards #-}
 {-# Language ScopedTypeVariables #-}
@@ -14,22 +15,22 @@ module EVM where
 
 import Prelude hiding (log, Word, exponent)
 
+import Data.SBV hiding (Word, output, Unknown)
+import Data.Proxy (Proxy(..))
 import EVM.ABI
 import EVM.Types
 import EVM.Solidity
 import EVM.Keccak
-import EVM.Concrete hiding ((^))
+import EVM.Concrete (Word(..), Whiff(..), w256, sliceMemory, createAddress, wordValue, keccakBlob, create2Address)
+import EVM.Symbolic
 import EVM.Op
 import EVM.FeeSchedule (FeeSchedule (..))
-
 import qualified EVM.Precompiled
 
 import Data.Binary.Get (runGetOrFail)
 import Data.Text (Text)
 import Data.Word (Word8, Word32)
-import Data.Bits (bit, testBit, complement, xor, shiftR, (.&.), (.|.), FiniteBits(..))
-
-import Control.Lens hiding (op, (:<), (|>))
+import Control.Lens hiding (op, (:<), (|>), (.>))
 import Control.Monad.State.Strict hiding (state)
 
 import Data.ByteString              (ByteString)
@@ -70,38 +71,40 @@ data Error
   | Revert ByteString
   | NoSuchContract Addr
   | OutOfGas Word Word
-  | BadCheatCode Word32
+  | BadCheatCode (Maybe Word32)
   | StackLimitExceeded
   | IllegalOverflow
   | Query Query
+  | Choose Choose
   | StateChangeWhileStatic
   | InvalidMemoryAccess
   | CallDepthLimitReached
   | MaxCodeSizeExceeded Word Word
   | PrecompileFailure
-
+  | UnexpectedSymbolicArg
 deriving instance Show Error
 
 -- | The possible result states of a VM
 data VMResult
   = VMFailure Error -- ^ An operation failed
-  | VMSuccess ByteString -- ^ Reached STOP, RETURN, or end-of-code
+  | VMSuccess Buffer -- ^ Reached STOP, RETURN, or end-of-code
 
 deriving instance Show VMResult
 
 -- | The state of a stepwise EVM execution
 data VM = VM
-  { _result        :: Maybe VMResult
-  , _state         :: FrameState
-  , _frames        :: [Frame]
-  , _env           :: Env
-  , _block         :: Block
-  , _tx            :: TxState
-  , _logs          :: Seq Log
-  , _traces        :: Zipper.TreePos Zipper.Empty Trace
-  , _cache         :: Cache
-  , _execMode      :: ExecMode
-  , _burned        :: Word
+  { _result         :: Maybe VMResult
+  , _state          :: FrameState
+  , _frames         :: [Frame]
+  , _env            :: Env
+  , _block          :: Block
+  , _tx             :: TxState
+  , _logs           :: Seq Log
+  , _traces         :: Zipper.TreePos Zipper.Empty Trace
+  , _cache          :: Cache
+  , _burned         :: Word
+  , _pathConditions :: [SBool]
+  , _iterations     :: Map CodeLocation Int
   }
 
 data Trace = Trace
@@ -116,13 +119,15 @@ data TraceData
   | QueryTrace Query
   | ErrorTrace Error
   | EntryTrace Text
-  | ReturnTrace ByteString FrameContext
-
-data ExecMode = ExecuteNormally | ExecuteAsBlockchainTest | ExecuteAsVMTest
+  | ReturnTrace Buffer FrameContext
 
 data Query where
-  PleaseFetchContract :: Addr         -> (Contract -> EVM ()) -> Query
-  PleaseFetchSlot     :: Addr -> Word -> (Word     -> EVM ()) -> Query
+  PleaseFetchContract :: Addr         -> (Contract   -> EVM ()) -> Query
+  PleaseFetchSlot     :: Addr -> Word -> (Word       -> EVM ()) -> Query
+  PleaseAskSMT        :: SymWord -> [SBool] -> (JumpCondition -> EVM ()) -> Query
+
+data Choose where
+  PleaseChoosePath    :: (Word -> EVM ()) -> Choose
 
 instance Show Query where
   showsPrec _ = \case
@@ -132,23 +137,37 @@ instance Show Query where
       (("<EVM.Query: fetch slot "
         ++ show slot ++ " for "
         ++ show addr ++ ">") ++)
+    PleaseAskSMT condition pathConditions _ ->
+      (("<EVM.Query: ask SMT about "
+        ++ show condition ++ " in context "
+        ++ show pathConditions ++ ">") ++)
+
+instance Show Choose where
+  showsPrec _ = \case
+    PleaseChoosePath _ ->
+      (("<EVM.Choice: waiting for user to select path (0,1)") ++)
 
 -- | Alias for the type of e.g. @exec1@.
 type EVM a = State VM a
 
+type CodeLocation = (Addr, Int)
+data JumpCondition = Known Word | Unknown
+  deriving (Show)
+
 -- | The cache is data that can be persisted for efficiency:
 -- any expensive query that is constant at least within a block.
 data Cache = Cache
-  { _fetched :: Map Addr Contract
+  { _fetched :: Map Addr Contract,
+    _path :: Map (CodeLocation, Int) JumpCondition
   } deriving Show
 
 -- | A way to specify an initial VM state
 data VMOpts = VMOpts
   { vmoptContract :: Contract
-  , vmoptCalldata :: ByteString
-  , vmoptValue :: W256
+  , vmoptCalldata :: (Buffer, (SWord 32)) -- maximum size of uint32 as per eip 1985
+  , vmoptValue :: SymWord
   , vmoptAddress :: Addr
-  , vmoptCaller :: Addr
+  , vmoptCaller :: SAddr
   , vmoptOrigin :: Addr
   , vmoptGas :: W256
   , vmoptGaslimit :: W256
@@ -160,11 +179,12 @@ data VMOpts = VMOpts
   , vmoptBlockGaslimit :: W256
   , vmoptGasprice :: W256
   , vmoptSchedule :: FeeSchedule Word
+  , vmoptChainId :: W256
   , vmoptCreate :: Bool
   } deriving Show
 
 -- | A log entry
-data Log = Log Addr ByteString [Word]
+data Log = Log Addr Buffer [SymWord]
 
 -- | An entry in the VM's "call/create stack"
 data Frame = Frame
@@ -184,7 +204,7 @@ data FrameContext
     , callContextSize      :: Word
     , callContextCodehash  :: W256
     , callContextAbi       :: Maybe Word
-    , callContextData      :: ByteString
+    , callContextData      :: Buffer
     , callContextReversion :: Map Addr Contract
     , callContextSubState  :: SubState
     }
@@ -195,14 +215,14 @@ data FrameState = FrameState
   , _codeContract :: Addr
   , _code         :: ByteString
   , _pc           :: Int
-  , _stack        :: [Word]
-  , _memory       :: ByteString
+  , _stack        :: [SymWord]
+  , _memory       :: Buffer
   , _memorySize   :: Int
-  , _calldata     :: ByteString
-  , _callvalue    :: Word
-  , _caller       :: Addr
+  , _calldata     :: (Buffer, (SWord 32))
+  , _callvalue    :: SymWord
+  , _caller       :: SAddr
   , _gas          :: Word
-  , _returndata   :: ByteString
+  , _returndata   :: Buffer
   , _static       :: Bool
   }
 
@@ -212,11 +232,10 @@ data TxState = TxState
   , _txgaslimit      :: Word
   , _origin          :: Addr
   , _toAddr          :: Addr
-  , _value           :: Word
+  , _value           :: SymWord
   , _substate        :: SubState
   , _isCreate        :: Bool
   , _txReversion     :: Map Addr Contract
-  , _origStorage     :: Map Addr Contract
   }
 
 -- | The "accrued substate" across a transaction
@@ -236,16 +255,33 @@ data ContractCode
   | RuntimeCode ByteString  -- ^ "Instance" code, after contract creation
   deriving (Show, Eq)
 
+-- | A contract can either have concrete or symbolic storage
+-- depending on what type of execution we are doing
+data Storage
+  = Concrete (Map Word SymWord)
+  | Symbolic (SArray (WordN 256) (WordN 256))
+  deriving (Show)
+
+-- to allow for Eq Contract (which useful for debugging vmtests)
+-- we mock an instance of Eq for symbolic storage.
+-- It should not (cannot) be used though.
+instance Eq Storage where
+  (==) (Concrete a) (Concrete b) = fmap forceLit a == fmap forceLit b
+  (==) (Symbolic _) (Concrete _) = False
+  (==) (Concrete _) (Symbolic _) = False
+  (==) _ _ = error "do not compare two symbolic arrays like this!"
+
 -- | The state of a contract
 data Contract = Contract
   { _contractcode :: ContractCode
-  , _storage      :: Map Word Word
+  , _storage      :: Storage
   , _balance      :: Word
   , _nonce        :: Word
   , _codehash     :: W256
   , _opIxMap      :: Vector Int
   , _codeOps      :: RegularVector.Vector (Int, Op)
   , _external     :: Bool
+  , _origStorage  :: Map Word Word
   }
 
 deriving instance Show Contract
@@ -253,9 +289,10 @@ deriving instance Eq Contract
 
 -- | Various environmental data
 data Env = Env
-  { _contracts :: Map Addr Contract
-  , _chainId   :: Word
-  , _sha3Crack :: Map Word ByteString
+  { _contracts  :: Map Addr Contract
+  , _chainId    :: Word
+  , _sha3Crack  :: Map Word ByteString
+  , _keccakUsed :: [([SWord 8], SWord 256)]
   }
 
 
@@ -279,7 +316,7 @@ blankState = FrameState
   , _stack        = mempty
   , _memory       = mempty
   , _memorySize   = 0
-  , _calldata     = mempty
+  , _calldata     = (mempty, 0)
   , _callvalue    = 0
   , _caller       = 0
   , _gas          = 0
@@ -307,10 +344,14 @@ bytecode = contractcode . to f
 
 instance Semigroup Cache where
   a <> b = Cache
-    { _fetched = mappend (view fetched a) (view fetched b) }
+    { _fetched = mappend (view fetched a) (view fetched b),
+      _path = mappend (view path a) (view path b)
+    }
 
 instance Monoid Cache where
-  mempty = Cache { _fetched = mempty }
+  mempty = Cache { _fetched = mempty,
+                   _path = mempty
+                 }
 
 -- * Data accessors
 
@@ -329,12 +370,10 @@ makeVm o = VM
     , _txgaslimit = w256 $ vmoptGaslimit o
     , _origin = vmoptOrigin o
     , _toAddr = vmoptAddress o
-    , _value = w256 $ vmoptValue o
+    , _value = vmoptValue o
     , _substate = SubState mempty mempty mempty
     , _isCreate = vmoptCreate o
     , _txReversion = Map.fromList
-      [(vmoptAddress o, vmoptContract o)]
-    , _origStorage = Map.fromList
       [(vmoptAddress o, vmoptContract o)]
     }
   , _logs = mempty
@@ -357,7 +396,7 @@ makeVm o = VM
     , _contract = vmoptAddress o
     , _codeContract = vmoptAddress o
     , _calldata = vmoptCalldata o
-    , _callvalue = w256 $ vmoptValue o
+    , _callvalue = vmoptValue o
     , _caller = vmoptCaller o
     , _gas = w256 $ vmoptGas o
     , _returndata = mempty
@@ -365,14 +404,17 @@ makeVm o = VM
     }
   , _env = Env
     { _sha3Crack = mempty
-    , _chainId = 1
+    , _chainId = w256 $ vmoptChainId o
     , _contracts = Map.fromList
       [(vmoptAddress o, vmoptContract o)]
+    , _keccakUsed = mempty
     }
-  , _cache = Cache $ Map.fromList
-    [(vmoptAddress o, vmoptContract o)]
-  , _execMode = ExecuteNormally
+  , _cache = Cache (Map.fromList
+    [(vmoptAddress o, vmoptContract o)])
+    mempty
   , _burned = 0
+  , _pathConditions = []
+  , _iterations = mempty
   } where theCode = case _contractcode (vmoptContract o) of
             InitCode b    -> b
             RuntimeCode b -> b
@@ -383,12 +425,13 @@ initialContract theContractCode = Contract
   , _codehash =
     if BS.null theCode then 0 else
       keccak (stripBytecodeMetadata theCode)
-  , _storage  = mempty
+  , _storage  = Concrete mempty
   , _balance  = 0
   , _nonce    = 0
   , _opIxMap  = mkOpIxMap theCode
   , _codeOps  = mkCodeOps theCode
   , _external = False
+  , _origStorage = mempty
   } where theCode = case theContractCode of
             InitCode b    -> b
             RuntimeCode b -> b
@@ -412,31 +455,37 @@ exec1 = do
     mem  = the state memory
     stk  = the state stack
     self = the state contract
-    this = fromMaybe (error "internal error: state contract") (preview (ix (the state contract)) (the env contracts))
+    this = fromMaybe (error "internal error: state contract") (preview (ix self) (the env contracts))
 
     fees@FeeSchedule {..} = the block schedule
 
-    doStop = finishFrame (FrameReturned "")
+    doStop = finishFrame (FrameReturned mempty)
 
   if self > 0x0 && self <= 0x9 then do
     -- call to precompile
     let ?op = 0x00 -- dummy value
     let
-      calldatasize = num $ BS.length (the state calldata)
-    copyBytesToMemory (the state calldata) calldatasize 0 0
-    executePrecompile fees self (the state gas) 0 calldatasize 0 0 []
-    use (state . stack) >>= \case
-      (0:_) ->
-        fetchAccount self $ \_ -> do
-          touchAccount self
-          vmError PrecompileFailure
-      (1:_) ->
-        fetchAccount self $ \_ -> do
-          touchAccount self
-          out <- use (state . returndata)
-          finishFrame (FrameReturned out)
-      _ ->
-        underrun
+      calldatasize = snd (the state calldata)
+    case unliteral calldatasize of
+        Nothing -> vmError UnexpectedSymbolicArg
+        Just calldatasize' -> do
+          copyBytesToMemory (fst $ the state calldata) (num calldatasize') 0 0
+          executePrecompile self (the state gas) 0 (num calldatasize') 0 0 []
+          vmx <- get
+          case view (state.stack) vmx of
+            (x:_) -> case maybeLitWord x of
+              Just 0 -> do
+                fetchAccount self $ \_ -> do
+                  touchAccount self
+                  vmError PrecompileFailure
+              Just _ ->
+                fetchAccount self $ \_ -> do
+                  touchAccount self
+                  out <- use (state . returndata)
+                  finishFrame (FrameReturned out)
+              Nothing -> vmError UnexpectedSymbolicArg
+            _ ->
+              underrun
 
   else if the state pc >= num (BS.length (the state code))
     then doStop
@@ -465,7 +514,7 @@ exec1 = do
               limitStack 1 $
                 burn g_verylow $ do
                   next
-                  push y
+                  pushSym y
 
         -- op: SWAP
         x | x >= 0x90 && x <= 0x9f -> do
@@ -484,20 +533,21 @@ exec1 = do
           notStatic $
           let n = (num x - 0xa0) in
           case stk of
-            (xOffset:xSize:xs) ->
+            (xOffset':xSize':xs) ->
               if length xs < n
               then underrun
-              else do
-                let (topics, xs') = splitAt n xs
-                    bytes         = readMemory (num xOffset) (num xSize) vm
-                    log           = Log self bytes topics
+              else
+                forceConcrete2 (xOffset', xSize') $ \(xOffset, xSize) -> do
+                    let (topics, xs') = splitAt n xs
+                        bytes         = readMemory (num xOffset) (num xSize) vm
+                        log           = Log self bytes topics
 
-                burn (g_log + g_logdata * xSize + num n * g_logtopic) $
-                  accessMemoryRange fees xOffset xSize
-                    $ do traceLog log
-                         next
-                         assign (state . stack) xs'
-                         pushToSequence logs log
+                    burn (g_log + g_logdata * xSize + num n * g_logtopic) $
+                      accessMemoryRange fees xOffset xSize $ do
+                        traceLog log
+                        next
+                        assign (state . stack) xs'
+                        pushToSequence logs log
             _ ->
               underrun
 
@@ -512,18 +562,14 @@ exec1 = do
         0x03 -> stackOp2 (const g_verylow) (uncurry (-))
 
         -- op: DIV
-        0x04 -> stackOp2 (const g_low) $
-          \case (_, 0) -> 0
-                (x, y) -> div x y
+        0x04 -> stackOp2 (const g_low) (uncurry (sDiv))
 
         -- op: SDIV
         0x05 ->
           stackOp2 (const g_low) (uncurry sdiv)
 
         -- op: MOD
-        0x06 -> stackOp2 (const g_low) $ \case
-          (_, 0) -> 0
-          (x, y) -> mod x y
+        0x06 -> stackOp2 (const g_low) $ \(x, y) -> ite (y .== 0) 0 (x `sMod` y)
 
         -- op: SMOD
         0x07 -> stackOp2 (const g_low) $ uncurry smod
@@ -533,18 +579,18 @@ exec1 = do
         0x09 -> stackOp3 (const g_mid) (\(x, y, z) -> mulmod x y z)
 
         -- op: LT
-        0x10 -> stackOp2 (const g_verylow) $ \(x, y) -> if x < y then 1 else 0
+        0x10 -> stackOp2 (const g_verylow) $ \(x, y) -> ite (x .< y) 1 0
         -- op: GT
-        0x11 -> stackOp2 (const g_verylow) $ \(x, y) -> if x > y then 1 else 0
+        0x11 -> stackOp2 (const g_verylow) $ \(x, y) -> ite (x .> y) 1 0
         -- op: SLT
         0x12 -> stackOp2 (const g_verylow) $ uncurry slt
         -- op: SGT
         0x13 -> stackOp2 (const g_verylow) $ uncurry sgt
 
         -- op: EQ
-        0x14 -> stackOp2 (const g_verylow) $ \(x, y) -> if x == y then 1 else 0
+        0x14 -> stackOp2 (const g_verylow) $ \(x, y) -> ite (x .== y) 1 0
         -- op: ISZERO
-        0x15 -> stackOp1 (const g_verylow) $ \case 0 -> 1; _ -> 0
+        0x15 -> stackOp1 (const g_verylow) $ \x -> ite (x .== 0) 1 0
 
         -- op: AND
         0x16 -> stackOp2 (const g_verylow) $ uncurry (.&.)
@@ -557,40 +603,60 @@ exec1 = do
 
         -- op: BYTE
         0x1a -> stackOp2 (const g_verylow) $ \case
-          (n, _) | n >= 32 ->
-            0
-          (n, x) ->
-            0xff .&. shiftR x (8 * (31 - num n))
+          (n, _) | (forceLit n) >= 32 -> 0
+          (n, x) | otherwise          -> 0xff .&. shiftR x (8 * (31 - num (forceLit n)))
 
         -- op: SHL
-        0x1b -> stackOp2 (const g_verylow) $ \(n, x) -> shl x n
+        0x1b -> stackOp2 (const g_verylow) $ \((S _ n), (S _ x)) -> sw256 $ sShiftLeft x n
         -- op: SHR
-        0x1c -> stackOp2 (const g_verylow) $ \(n, x) -> shr x n
+        0x1c -> stackOp2 (const g_verylow) $ \((S _ n), (S _ x)) -> sw256 $ sShiftRight x n
         -- op: SAR
-        0x1d -> stackOp2 (const g_verylow) $ \(n, x) -> sar x n
+        0x1d -> stackOp2 (const g_verylow) $ \((S _ n), (S _ x)) -> sw256 $ sSignedShiftArithRight x n
 
         -- op: SHA3
+        -- more accurately refered to as KECCAK
         0x20 ->
           case stk of
-            ((num -> xOffset) : (num -> xSize) : xs) -> do
-              let bytes = readMemory xOffset xSize vm
-                  hash  = keccakBlob bytes
-              burn (g_sha3 + g_sha3word * ceilDiv (num xSize) 32) $
-                accessMemoryRange fees xOffset xSize $ do
-                  next
-                  assign (state . stack) (hash : xs)
-                  assign (env . sha3Crack . at hash) (Just bytes)
+            (xOffset' : xSize' : xs) ->
+              forceConcrete xOffset' $
+                \xOffset -> forceConcrete xSize' $ \xSize -> do
+                  let bytes = readMemory xOffset xSize vm
+                  (hash, invMap) <- case readMemory xOffset xSize vm of
+                                     ConcreteBuffer bs -> pure (litWord $ keccakBlob bs, Map.singleton (keccakBlob bs) bs)
+
+                                     -- Although we would like to simply assert that the uninterpreted function symkeccak'
+                                     -- is injective, this proves to cause a lot of concern for our smt solvers, probably
+                                     -- due to the introduction of universal quantifiers into the queries.
+
+                                     -- Instead, we keep track of all of the particular invocations of symkeccak' we see
+                                     -- (similarly to sha3Crack), and simply assert that injectivity holds for these
+                                     -- particular invocations.
+
+                                     SymbolicBuffer bs -> do
+                                                   let hash' = symkeccak' bs
+                                                       previousUsed = view (env . keccakUsed) vm
+                                                   env . keccakUsed <>= [(bs, hash')]
+                                                   pathConditions <>= fmap (\(preimage, image) ->
+                                                                               image .== hash' .=> preimage .== bs)
+                                                                           previousUsed
+                                                   return (sw256 hash', mempty)
+
+                  burn (g_sha3 + g_sha3word * ceilDiv (num xSize) 32) $
+                    accessMemoryRange fees xOffset xSize $ do
+                      next
+                      assign (state . stack) (hash : xs)
+                      (env . sha3Crack) <>= invMap
             _ -> underrun
 
         -- op: ADDRESS
         0x30 ->
           limitStack 1 $
-            burn g_base (next >> push (num (the state contract)))
+            burn g_base (next >> push (num self))
 
         -- op: BALANCE
         0x31 ->
           case stk of
-            (x:xs) ->
+            (x':xs) -> forceConcrete x' $ \x ->
               burn g_balance $
                 fetchAccount (num x) $ \c -> do
                   next
@@ -607,31 +673,36 @@ exec1 = do
         -- op: CALLER
         0x33 ->
           limitStack 1 . burn g_base $
-            next >> push (num (the state caller))
+            let toSymWord = sw256 . sFromIntegral . saddressWord160
+            in next >> pushSym (toSymWord (the state caller))
 
         -- op: CALLVALUE
         0x34 ->
           limitStack 1 . burn g_base $
-            next >> push (the state callvalue)
+            next >> pushSym (the state callvalue)
 
         -- op: CALLDATALOAD
         0x35 -> stackOp1 (const g_verylow) $
-          \x -> readBlobWord x (the state calldata)
+          \(S _ x) -> uncurry (readSWordWithBound (sFromIntegral x)) (the state calldata)
 
         -- op: CALLDATASIZE
         0x36 ->
           limitStack 1 . burn g_base $
-            next >> push (blobSize (the state calldata))
+            next >> pushSym (sw256 . zeroExtend . snd $ (the state calldata))
 
         -- op: CALLDATACOPY
         0x37 ->
           case stk of
-            ((num -> xTo) : (num -> xFrom) : (num -> xSize) :xs) ->
+            (xTo' : xFrom' : xSize' : xs) -> forceConcrete3 (xTo',xFrom',xSize') $ \(xTo,xFrom,xSize) ->
               burn (g_verylow + g_copy * ceilDiv xSize 32) $
                 accessUnboundedMemoryRange fees xTo xSize $ do
                   next
                   assign (state . stack) xs
-                  copyBytesToMemory (the state calldata) xSize xFrom xTo
+                  case the state calldata of
+                    (SymbolicBuffer cd, cdlen) -> copyBytesToMemory (SymbolicBuffer [ite (i .<= cdlen) x 0 | (x, i) <- zip cd [1..]]) xSize xFrom xTo
+                    -- when calldata is concrete,
+                    -- the bound should always be equal to the bytestring length
+                    (cd, _) -> copyBytesToMemory cd xSize xFrom xTo 
             _ -> underrun
 
         -- op: CODESIZE
@@ -642,12 +713,12 @@ exec1 = do
         -- op: CODECOPY
         0x39 ->
           case stk of
-            ((num -> memOffset) : (num -> codeOffset) : (num -> n) : xs) ->
+            (memOffset' : codeOffset' : n' : xs) -> forceConcrete3 (memOffset',codeOffset',n') $ \(memOffset,codeOffset,n) -> do
               burn (g_verylow + g_copy * ceilDiv (num n) 32) $
                 accessUnboundedMemoryRange fees memOffset n $ do
                   next
                   assign (state . stack) xs
-                  copyBytesToMemory (the state code)
+                  copyBytesToMemory (ConcreteBuffer (the state code))
                     n codeOffset memOffset
             _ -> underrun
 
@@ -659,7 +730,7 @@ exec1 = do
         -- op: EXTCODESIZE
         0x3b ->
           case stk of
-            (x:xs) ->
+            (x':xs) -> forceConcrete x' $ \x ->
               if x == num cheatCode
                 then do
                   next
@@ -677,42 +748,45 @@ exec1 = do
         -- op: EXTCODECOPY
         0x3c ->
           case stk of
-            ( extAccount
-              : (num -> memOffset)
-              : (num -> codeOffset)
-              : (num -> codeSize)
+            ( extAccount'
+              : memOffset'
+              : codeOffset'
+              : codeSize'
               : xs ) ->
-              burn (g_extcode + g_copy * ceilDiv (num codeSize) 32) $
-                accessUnboundedMemoryRange fees memOffset codeSize $
-                  fetchAccount (num extAccount) $ \c -> do
-                    next
-                    assign (state . stack) xs
-                    copyBytesToMemory (view bytecode c)
-                      codeSize codeOffset memOffset
+              forceConcrete4 (extAccount', memOffset', codeOffset', codeSize') $
+                \(extAccount, memOffset, codeOffset, codeSize) ->
+                  burn (g_extcode + g_copy * ceilDiv (num codeSize) 32) $
+                    accessUnboundedMemoryRange fees memOffset codeSize $
+                      fetchAccount (num extAccount) $ \c -> do
+                        next
+                        assign (state . stack) xs
+                        copyBytesToMemory (ConcreteBuffer (view bytecode c))
+                          codeSize codeOffset memOffset
             _ -> underrun
 
         -- op: RETURNDATASIZE
         0x3d ->
           limitStack 1 . burn g_base $
-            next >> push (blobSize (the state returndata))
+            next >> push (num $ len (the state returndata))
 
         -- op: RETURNDATACOPY
         0x3e ->
           case stk of
-            ((num -> xTo) : (num -> xFrom) : (num -> xSize) :xs) ->
-              burn (g_verylow + g_copy * ceilDiv xSize 32) $
-                accessUnboundedMemoryRange fees xTo xSize $ do
-                  next
-                  assign (state . stack) xs
-                  if (BS.length (the state returndata) < (num xFrom) + (num xSize))
-                  then vmError InvalidMemoryAccess
-                  else copyBytesToMemory (the state returndata) xSize xFrom xTo
+            (xTo' : xFrom' : xSize' :xs) -> forceConcrete3 (xTo', xFrom', xSize') $
+              \(xTo, xFrom, xSize) ->
+                burn (g_verylow + g_copy * ceilDiv xSize 32) $
+                  accessUnboundedMemoryRange fees xTo xSize $ do
+                    next
+                    assign (state . stack) xs
+                    if len (the state returndata) < num xFrom + num xSize
+                    then vmError InvalidMemoryAccess
+                    else copyBytesToMemory (the state returndata) xSize xFrom xTo
             _ -> underrun
 
         -- op: EXTCODEHASH
         0x3f ->
           case stk of
-            (x:xs) ->
+            (x':xs) -> forceConcrete x' $ \x ->
               burn g_extcodehash $ do
                 next
                 assign (state . stack) xs
@@ -724,11 +798,11 @@ exec1 = do
               underrun
 
         -- op: BLOCKHASH
-        0x40 ->
+        0x40 -> do
           -- We adopt the fake block hash scheme of the VMTests,
           -- so that blockhash(i) is the hash of i as decimal ASCII.
           stackOp1 (const g_blockhash) $
-            \i ->
+            \(forceLit -> i) ->
               if i + 256 < the block number || i >= the block number
               then 0
               else
@@ -779,7 +853,7 @@ exec1 = do
         -- op: MLOAD
         0x51 ->
           case stk of
-            (x:xs) ->
+            (x':xs) -> forceConcrete x' $ \x ->
               burn g_verylow $
                 accessMemoryWord fees x $ do
                   next
@@ -789,7 +863,7 @@ exec1 = do
         -- op: MSTORE
         0x52 ->
           case stk of
-            (x:y:xs) ->
+            (x':y:xs) -> forceConcrete x' $ \x ->
               burn g_verylow $
                 accessMemoryWord fees x $ do
                   next
@@ -800,11 +874,12 @@ exec1 = do
         -- op: MSTORE8
         0x53 ->
           case stk of
-            (x:y:xs) ->
+            (x':(S _ y):xs) -> forceConcrete x' $ \x ->
               burn g_verylow $
                 accessMemoryRange fees x 1 $ do
+                  let yByte = bvExtract (Proxy :: Proxy 7) (Proxy :: Proxy 0) y
                   next
-                  modifying (state . memory) (setMemoryByte x (wordToByte y))
+                  modifying (state . memory) (setMemoryByte x yByte)
                   assign (state . stack) xs
             _ -> underrun
 
@@ -829,61 +904,65 @@ exec1 = do
                 if availableGas <= g_callstipend
                   then finishFrame (FrameErrored (OutOfGas availableGas g_callstipend))
                   else do
-                    original <- use (tx . origStorage . at self . non
-                             (initialContract (EVM.RuntimeCode mempty))
-                             . storage . at x . non 0)
+                    let original = case view storage this of
+                                  Concrete _ -> fromMaybe 0 (Map.lookup (forceLit x) (view origStorage this))
+                                  Symbolic _ -> 0 -- we don't use this value anywhere anyway
+                        cost = case (maybeLitWord current, maybeLitWord new) of
+                                 (Just current', Just new') ->
+                                    if (current' == new') then g_sload
+                                    else if (current' == original) && (original == 0) then g_sset
+                                    else if (current' == original) then g_sreset
+                                    else g_sload
 
-                    let cost | (current == new) = g_sload
-                             | (current == original) && (original == 0) = g_sset
-                             | (current == original) = g_sreset
-                             | otherwise = g_sload
+                                 -- if any of the arguments are symbolic,
+                                 -- assume worst case scenario
+                                 _ -> g_sset
 
                     burn cost $ do
                       next
                       assign (state . stack) xs
-                      assign (env . contracts . ix (the state contract) . storage . at x)
-                        (Just new)
+                      modifying (env . contracts . ix self . storage)
+                        (writeStorage x new)
 
-                      case current == new of
-                        True  -> noop
-                        False -> case current == original of
-
-                            True -> if (original /= 0) && (new == 0)
-                                           then refund r_sclear
-                                           else noop
-
-                            False -> do if (original /= 0)
-                                            then
-                                              if new == 0
-                                                 then refund r_sclear
-                                                 else unRefund r_sclear
-                                            else noop
-
-                                        if original == new
-                                           then
-                                             if original == 0
-                                                then refund (g_sset - g_sload)
-                                                else refund (g_sreset - g_sload)
-                                           else noop
-
+                      case (maybeLitWord current, maybeLitWord new) of
+                         (Just current', Just new') ->
+                            unless (current' == new') $
+                              if current' == original
+                              then when (original /= 0 && new' == 0) $
+                                      refund r_sclear
+                              else do
+                                      when (original /= 0) $
+                                        if new' == 0
+                                        then refund r_sclear
+                                        else unRefund r_sclear
+                                      when (original == new') $
+                                        if original == 0
+                                        then refund (g_sset - g_sload)
+                                        else refund (g_sreset - g_sload)
+                         -- if any of the arguments are symbolic,
+                         -- don't change the refund counter
+                         _ -> noop
             _ -> underrun
 
         -- op: JUMP
         0x56 ->
           case stk of
             (x:xs) ->
-              burn g_mid $
-                checkJump x xs
+              burn g_mid $ forceConcrete x $ \x' ->
+                checkJump x' xs
             _ -> underrun
 
         -- op: JUMPI
-        0x57 ->
+        0x57 -> do
           case stk of
-            (x:y:xs) ->
-              burn g_high $
-                if y == 0
-                  then assign (state . stack) xs >> next
-                  else checkJump x xs
+            (x:y:xs) -> forceConcrete x $ \x' ->
+                burn g_high $
+                  let jump 0 = assign (state . stack) xs >> next
+                      jump _ = checkJump x' xs
+                  in case maybeLitWord y of
+                      Just y' -> jump y'
+                      -- if the jump condition is symbolic, an smt query has to be made.
+                      Nothing -> askSMT self (the state pc) y jump
             _ -> underrun
 
         -- op: PC
@@ -906,68 +985,61 @@ exec1 = do
 
         -- op: EXP
         0x0a ->
-          let cost (_, exponent) =
+          let cost (_ ,(forceLit -> exponent)) =
                 if exponent == 0
                 then g_exp
                 else g_exp + g_expbyte * num (ceilDiv (1 + log2 exponent) 8)
-          in stackOp2 cost (uncurry exponentiate)
+          in stackOp2 cost $ \((S _ x),(S _ y)) -> sw256 $ x .^ y
 
         -- op: SIGNEXTEND
         0x0b ->
-          stackOp2 (const g_low) $ \(bytes, x) ->
-            if bytes >= 32 then x
+          stackOp2 (const g_low) $ \((forceLit -> bytes), w@(S _ x)) ->
+            if bytes >= 32 then w
             else let n = num bytes * 8 + 7 in
-              if testBit x n
-              then x .|. complement (bit n - 1)
-              else x .&. (bit n - 1)
+              sw256 $ ite (sTestBit x n)
+                      (x .|. complement (bit n - 1))
+                      (x .&. (bit n - 1))
 
         -- op: CREATE
         0xf0 ->
           notStatic $
           case stk of
-            (xValue:xOffset:xSize:xs) ->
-              accessMemoryRange fees xOffset xSize $ do
-                availableGas <- use (state . gas)
-                let
-                  initCode = readMemory (num xOffset) (num xSize) vm
-                  newAddr = createAddress self (wordValue (view nonce this))
-                  (cost, gas') = costOfCreate fees availableGas 0
-                burn (cost - gas') $
-                  create self this gas' xValue xs newAddr initCode
+            (xValue' : xOffset' : xSize' : xs) -> forceConcrete3 (xValue', xOffset', xSize') $
+              \(xValue, xOffset, xSize) -> do
+                accessMemoryRange fees xOffset xSize $ do
+                  availableGas <- use (state . gas)
+                  let
+                    newAddr = createAddress self (wordValue (view nonce this))
+                    (cost, gas') = costOfCreate fees availableGas 0
+                  burn (cost - gas') $ forceConcreteBuffer (readMemory (num xOffset) (num xSize) vm) $ \initCode ->
+                    create self this gas' xValue xs newAddr initCode
             _ -> underrun
 
         -- op: CALL
         0xf1 ->
           case stk of
-            ( xGas
-              : (num -> xTo)
-              : xValue
-              : xInOffset
-              : xInSize
-              : xOutOffset
-              : xOutSize
+            ( xGas'
+              : xTo'
+              : (forceLit -> xValue)
+              : xInOffset'
+              : xInSize'
+              : xOutOffset'
+              : xOutSize'
               : xs
-             ) ->
+             ) -> forceConcrete6 (xGas', xTo', xInOffset', xInSize', xOutOffset', xOutSize') $
+              \(xGas, (num -> xTo), xInOffset, xInSize, xOutOffset, xOutSize) ->
               (if xValue > 0 then notStatic else id) $
-              case xTo of
-                n | n > 0 && n <= 9 ->
-                  precompiledContract vm fees xGas xTo xTo xValue xInOffset xInSize xOutOffset xOutSize xs
-                n | num n == cheatCode ->
-                  do
-                    assign (state . stack) xs
-                    cheat (xInOffset, xInSize) (xOutOffset, xOutSize)
-                _ ->
-                    accessMemoryRange fees xInOffset xInSize $
-                      accessMemoryRange fees xOutOffset xOutSize $ do
-                        availableGas <- use (state . gas)
-                        let
-                          recipientExists = accountExists xTo vm
-                          (cost, gas') = costOfCall fees recipientExists xValue availableGas xGas
-                        burn (cost - gas') $
-                          delegateCall this gas' xTo xValue xInOffset xInSize xOutOffset xOutSize xs $ do
+                case xTo of
+                  n | n > 0 && n <= 9 ->
+                    precompiledContract this xGas xTo xTo xValue xInOffset xInSize xOutOffset xOutSize xs
+                  n | num n == cheatCode ->
+                    do
+                      assign (state . stack) xs
+                      cheat (xInOffset, xInSize) (xOutOffset, xOutSize)
+                  _ -> delegateCall this xGas xTo xTo xValue xInOffset xInSize xOutOffset xOutSize xs $ do
                             zoom state $ do
-                              assign callvalue xValue
-                              assign caller (the state contract)
+                              assign callvalue (litWord xValue)
+                              assign caller (litAddr self)
                               assign contract xTo
                             zoom (env . contracts) $ do
                               ix self . balance -= xValue
@@ -980,51 +1052,45 @@ exec1 = do
         -- op: CALLCODE
         0xf2 ->
           case stk of
-            ( xGas
-              : (num -> xTo)
-              : xValue
-              : xInOffset
-              : xInSize
-              : xOutOffset
-              : xOutSize
+            ( xGas'
+              : xTo'
+              : (forceLit -> xValue)
+              : xInOffset'
+              : xInSize'
+              : xOutOffset'
+              : xOutSize'
               : xs
-              ) ->
-              case xTo of
-                n | n > 0 && n <= 9 ->
-                  precompiledContract vm fees xGas xTo self xValue xInOffset xInSize xOutOffset xOutSize xs
-                _ ->
-                  accessMemoryRange fees xInOffset xInSize $
-                    accessMemoryRange fees xOutOffset xOutSize $ do
-                      availableGas <- use (state . gas)
-                      let
-                        (cost, gas') = costOfCall fees True xValue availableGas xGas
-                      burn (cost - gas') $
-                        delegateCall this gas' xTo xValue xInOffset xInSize xOutOffset xOutSize xs $ do
-                          zoom state $ do
-                            assign callvalue xValue
-                            assign caller (the state contract)
-                          touchAccount self
+              ) -> forceConcrete6 (xGas', xTo', xInOffset', xInSize', xOutOffset', xOutSize') $
+              \(xGas, (num -> xTo), xInOffset, xInSize, xOutOffset, xOutSize) ->
+                case xTo of
+                  n | n > 0 && n <= 9 ->
+                    precompiledContract this xGas xTo self xValue xInOffset xInSize xOutOffset xOutSize xs
+                  _ -> delegateCall this xGas xTo self xValue xInOffset xInSize xOutOffset xOutSize xs $ do
+                         zoom state $ do
+                           assign callvalue (litWord xValue)
+                           assign caller (litAddr self)
+                         touchAccount self
             _ ->
               underrun
 
         -- op: RETURN
         0xf3 ->
           case stk of
-            (xOffset:xSize:_) ->
+            (xOffset' : xSize' :_) -> forceConcrete2 (xOffset', xSize') $ \(xOffset, xSize) ->
               accessMemoryRange fees xOffset xSize $ do
                 let
-                  output = readMemory (num xOffset) (num xSize) vm
-                  codesize = num (BS.length output)
+                  output = readMemory xOffset xSize vm
+                  codesize = num (len output)
                   maxsize = the block maxCodeSize
                 case view frames vm of
                   [] ->
-                    case the tx isCreate of
+                    case (the tx isCreate) of
                       True ->
                         if codesize > maxsize
                         then
                           finishFrame (FrameErrored (MaxCodeSizeExceeded maxsize codesize))
                         else
-                          burn (g_codedeposit * num (BS.length output)) $
+                          burn (g_codedeposit * codesize) $
                             finishFrame (FrameReturned output)
                       False ->
                         finishFrame (FrameReturned output)
@@ -1037,7 +1103,7 @@ exec1 = do
                         then
                           finishFrame (FrameErrored (MaxCodeSizeExceeded maxsize codesize))
                         else
-                          burn (g_codedeposit * num (BS.length output)) $
+                          burn (g_codedeposit * codesize) $
                             finishFrame (FrameReturned output)
                       CallContext {} ->
                           finishFrame (FrameReturned output)
@@ -1046,63 +1112,66 @@ exec1 = do
         -- op: DELEGATECALL
         0xf4 ->
           case stk of
-            (xGas:(num -> xTo):xInOffset:xInSize:xOutOffset:xOutSize:xs) ->
-              case xTo of
-                n | n > 0 && n <= 9 ->
-                  precompiledContract vm fees xGas xTo self 0 xInOffset xInSize xOutOffset xOutSize xs
-                n | num n == cheatCode -> do
-                      assign (state . stack) xs
-                      cheat (xInOffset, xInSize) (xOutOffset, xOutSize)
-                _ ->
-                  accessMemoryRange fees xInOffset xInSize $
-                    accessMemoryRange fees xOutOffset xOutSize $ do
-                    availableGas <- use (state . gas)
-                    let
-                      (cost, gas') = costOfCall fees True 0 availableGas xGas
-                    burn (cost - gas') $ do
-                      theCaller <- use (state . caller)
-                      delegateCall this gas' xTo 0 xInOffset xInSize xOutOffset xOutSize xs $ do
-                        touchAccount theCaller
-                        touchAccount self
+            (xGas'
+             :xTo'
+             :xInOffset'
+             :xInSize'
+             :xOutOffset'
+             :xOutSize'
+             :xs) -> forceConcrete6 (xGas', xTo', xInOffset', xInSize', xOutOffset', xOutSize') $
+              \(xGas, (num -> xTo), xInOffset, xInSize, xOutOffset, xOutSize) ->
+                case xTo of
+                  n | n > 0 && n <= 9 ->
+                    precompiledContract this xGas xTo self 0 xInOffset xInSize xOutOffset xOutSize xs
+                  n | num n == cheatCode -> do
+                        assign (state . stack) xs
+                        cheat (xInOffset, xInSize) (xOutOffset, xOutSize)
+                  _ -> do
+                        delegateCall this xGas xTo self 0 xInOffset xInSize xOutOffset xOutSize xs $ do
+                          touchAccount self
             _ -> underrun
 
         -- op: CREATE2
         0xf5 -> notStatic $
           case stk of
-            (xValue:xOffset:xSize:xSalt:xs) ->
-              accessMemoryRange fees xOffset xSize $ do
-                availableGas <- use (state . gas)
-                let
-                  initCode = readMemory (num xOffset) (num xSize) vm
-                  newAddr  = create2Address self (num xSalt) initCode
-                  (cost, gas') = costOfCreate fees availableGas xSize
-                burn (cost - gas') $
-                  create self this gas' xValue xs newAddr initCode
+            (xValue'
+             :xOffset'
+             :xSize'
+             :xSalt'
+             :xs) -> forceConcrete4 (xValue', xOffset', xSize', xSalt') $
+              \(xValue, xOffset, xSize, xSalt) ->
+                accessMemoryRange fees xOffset xSize $ do
+                  availableGas <- use (state . gas)
+                  forceConcreteBuffer (readMemory (num xOffset) (num xSize) vm) $ \initCode ->
+                   let
+                    newAddr  = create2Address self (num xSalt) initCode
+                    (cost, gas') = costOfCreate fees availableGas xSize
+                   in burn (cost - gas') $
+                    create self this gas' xValue xs newAddr initCode
             _ -> underrun
 
         -- op: STATICCALL
         0xfa ->
           case stk of
-            (xGas : (num -> xTo) : xInOffset : xInSize : xOutOffset : xOutSize : xs) ->
-              case xTo of
-                n | n > 0 && n <= 9 ->
-                  precompiledContract vm fees xGas xTo xTo 0 xInOffset xInSize xOutOffset xOutSize xs
-                _ ->
-                  accessMemoryRange fees xInOffset xInSize $
-                    accessMemoryRange fees xOutOffset xOutSize $ do
-                      availableGas <- use (state . gas)
-                      let
-                        recipientExists = accountExists xTo vm
-                        (cost, gas') = costOfCall fees recipientExists 0 availableGas xGas
-                      burn (cost - gas') $
-                        delegateCall this gas' xTo 0 xInOffset xInSize xOutOffset xOutSize xs $ do
-                          zoom state $ do
-                            assign callvalue 0
-                            assign caller (the state contract)
-                            assign contract xTo
-                            assign static True
-                          touchAccount self
-                          touchAccount xTo
+            (xGas'
+             :xTo'
+             :xInOffset'
+             :xInSize'
+             :xOutOffset'
+             :xOutSize'
+             :xs) -> forceConcrete6 (xGas', xTo', xInOffset', xInSize', xOutOffset', xOutSize') $
+              \(xGas, (num -> xTo), xInOffset, xInSize, xOutOffset, xOutSize) ->
+                case xTo of
+                  n | n > 0 && n <= 9 ->
+                    precompiledContract this xGas xTo xTo 0 xInOffset xInSize xOutOffset xOutSize xs
+                  _ -> delegateCall this xGas xTo xTo 0 xInOffset xInSize xOutOffset xOutSize xs $ do
+                            zoom state $ do
+                              assign callvalue 0
+                              assign caller (litAddr self)
+                              assign contract xTo
+                              assign static True
+                            touchAccount self
+                            touchAccount xTo
             _ ->
               underrun
 
@@ -1111,102 +1180,115 @@ exec1 = do
           notStatic $
           case stk of
             [] -> underrun
-            ((num -> xTo):_) ->
+            (xTo':_) -> forceConcrete xTo' $ \(num -> xTo) ->
               let
+                funds = view balance this
                 recipientExists = accountExists xTo vm
-                c_new = if not recipientExists && view balance this /= 0
+                c_new = if not recipientExists && funds /= 0
                         then num g_selfdestruct_newaccount
                         else 0
               in burn (g_selfdestruct + c_new) $ do
-                destructs <- use (tx . substate . selfdestructs)
-                if elem self destructs then noop else do refund r_selfdestruct
-                selfdestruct self
-                touchAccount xTo
+                   destructs <- use (tx . substate . selfdestructs)
+                   unless (elem self destructs) $ refund r_selfdestruct
+                   selfdestruct self
+                   touchAccount xTo
 
-                let funds = vm ^?! env . contracts . ix self . balance
-                if funds == 0
-                  then
-                    doStop
-                else if self == xTo
-                  then do
-                    assign (env . contracts . ix self . balance) 0
-                    doStop
-                else
-                  fetchAccount xTo $ \_ -> do
-                    assign (env . contracts . ix self . balance) 0
-                    modifying (env . contracts . ix xTo . balance)
-                      (+ (vm ^?! env . contracts . ix self . balance))
-                    doStop
+                   if funds /= 0
+                   then fetchAccount xTo $ \_ -> do
+                          env . contracts . ix xTo . balance += funds
+                          assign (env . contracts . ix self . balance) 0
+                          doStop
+                   else doStop
 
         -- op: REVERT
         0xfd ->
           case stk of
-            (xOffset:xSize:_) ->
+            (xOffset':xSize':_) -> forceConcrete2 (xOffset', xSize') $ \(xOffset, xSize) ->
               accessMemoryRange fees xOffset xSize $ do
-                let output = readMemory (num xOffset) (num xSize) vm
+                let output = readMemory xOffset xSize vm
                 finishFrame (FrameReverted output)
             _ -> underrun
 
         xxx ->
           vmError (UnrecognizedOpcode xxx)
 
+
+callChecks
+  :: (?op :: Word8)
+  => Contract -> Word -> Addr -> Word -> Word -> Word -> Word -> Word -> [SymWord]
+   -- continuation with gas avail for call
+  -> (Word -> EVM ())
+  -> EVM ()
+callChecks this xGas xContext xValue xInOffset xInSize xOutOffset xOutSize xs continue = do
+  vm <- get
+  let fees = view (block . schedule) vm
+  accessMemoryRange fees xInOffset xInSize $
+    accessMemoryRange fees xOutOffset xOutSize $ do
+      availableGas <- use (state . gas)
+      let recipientExists = accountExists xContext vm
+          (cost, gas') = costOfCall fees recipientExists xValue availableGas xGas
+      burn (cost - gas') $ do
+        if xValue > view balance this
+        then do
+          assign (state . stack) (0 : xs)
+          assign (state . returndata) mempty
+          pushTrace $ ErrorTrace $ BalanceTooLow xValue (view balance this)
+          next
+        else if length (view frames vm) >= 1024
+             then do
+               assign (state . stack) (0 : xs)
+               assign (state . returndata) mempty
+               pushTrace $ ErrorTrace $ CallDepthLimitReached
+               next
+             else continue gas'
+
 precompiledContract
   :: (?op :: Word8)
-  => VM
-  -> FeeSchedule Word
+  => Contract
   -> Word
   -> Addr
   -> Addr
   -> Word
   -> Word -> Word -> Word -> Word
-  -> [Word]
+  -> [SymWord]
   -> EVM ()
-precompiledContract vm fees gasCap precompileAddr recipient xValue inOffset inSize outOffset outSize xs =
-    accessMemoryRange fees inOffset inSize $
-      accessMemoryRange fees outOffset outSize $ do
-        availableGas <- use (state . gas)
-        let
-          self = view (state . contract) vm
-          Just this = view (env . contracts . at self) vm
-          recipientExists = accountExists recipient vm
-          (cost, gas') = costOfCall fees recipientExists xValue availableGas gasCap
-        burn (cost - gas') $
-          if xValue > view balance this then do
-            assign (state . stack) (0 : xs)
-            next
-          else do
-            executePrecompile fees precompileAddr gas' inOffset inSize outOffset outSize xs
-            stk <- use (state . stack)
-            case stk of
-              (0:_) ->
-                return ()
-              (1:_) ->
-                fetchAccount recipient $ \_ -> do
+precompiledContract this xGas precompileAddr recipient xValue inOffset inSize outOffset outSize xs =
+  callChecks this xGas recipient xValue inOffset inSize outOffset outSize xs $ \gas' ->
+  do
+    executePrecompile precompileAddr gas' inOffset inSize outOffset outSize xs
+    self <- use (state . contract)
+    stk <- use (state . stack)
+    case stk of
+      (x:_) -> case maybeLitWord x of
+        Just 0 ->
+          return ()
+        Just 1 ->
+          fetchAccount recipient $ \_ -> do
 
-                zoom (env . contracts) $ do
-                  ix self . balance -= xValue
-                  ix recipient  . balance += xValue
-                touchAccount self
-                touchAccount recipient
-                touchAccount precompileAddr
-              _ ->
-                underrun
+          zoom (env . contracts) $ do
+            ix self . balance -= xValue
+            ix recipient  . balance += xValue
+          touchAccount self
+          touchAccount recipient
+          touchAccount precompileAddr
+        _ -> vmError UnexpectedSymbolicArg
+      _ -> underrun
 
 executePrecompile
   :: (?op :: Word8)
-  => FeeSchedule Word
-  -> Addr
-  -> Word -> Word -> Word -> Word -> Word -> [Word]
+  => Addr
+  -> Word -> Word -> Word -> Word -> Word -> [SymWord]
   -> EVM ()
-executePrecompile fees preCompileAddr gasCap inOffset inSize outOffset outSize xs  = do
+executePrecompile preCompileAddr gasCap inOffset inSize outOffset outSize xs  = do
   vm <- get
   let input = readMemory (num inOffset) (num inSize) vm
+      fees = view (block . schedule) vm
       cost = costOfPrecompile fees preCompileAddr input
       notImplemented = error $ "precompile at address " <> show preCompileAddr <> " not yet implemented"
       precompileFail = burn (gasCap - cost) $ do
-                            assign (state . stack) (0 : xs)
-                            pushTrace $ ErrorTrace PrecompileFailure
-                            next
+                         assign (state . stack) (0 : xs)
+                         pushTrace $ ErrorTrace $ PrecompileFailure
+                         next
   if cost > gasCap then
     burn gasCap $ do
       assign (state . stack) (0 : xs)
@@ -1216,7 +1298,9 @@ executePrecompile fees preCompileAddr gasCap inOffset inSize outOffset outSize x
       case preCompileAddr of
         -- ECRECOVER
         0x1 ->
-          case EVM.Precompiled.execute 0x1 (truncpad 128 input) 32 of
+         -- TODO: support symbolic variant
+         forceConcreteBuffer input $ \input' ->
+          case EVM.Precompiled.execute 0x1 (truncpadlit 128 input') 32 of
             Nothing -> do
               -- return no output for invalid signature
               assign (state . stack) (1 : xs)
@@ -1224,14 +1308,16 @@ executePrecompile fees preCompileAddr gasCap inOffset inSize outOffset outSize x
               next
             Just output -> do
               assign (state . stack) (1 : xs)
-              assign (state . returndata) output
-              copyBytesToMemory output outSize 0 outOffset
+              assign (state . returndata) (ConcreteBuffer output)
+              copyBytesToMemory (ConcreteBuffer output) outSize 0 outOffset
               next
 
         -- SHA2-256
         0x2 ->
           let
-            hash  = BS.pack $ BA.unpack (Crypto.hash input :: Digest SHA256)
+            hash = case input of
+                     ConcreteBuffer input' -> ConcreteBuffer $ BS.pack $ BA.unpack $ (Crypto.hash input' :: Digest SHA256)
+                     SymbolicBuffer input' -> SymbolicBuffer $ symSHA256 input'
           in do
             assign (state . stack) (1 : xs)
             assign (state . returndata) hash
@@ -1240,10 +1326,13 @@ executePrecompile fees preCompileAddr gasCap inOffset inSize outOffset outSize x
 
         -- RIPEMD-160
         0x3 ->
+         -- TODO: support symbolic variant
+         forceConcreteBuffer input $ \input' ->
+
           let
             padding = BS.pack $ replicate 12 0
-            hash' = BS.pack $ BA.unpack (Crypto.hash input :: Digest RIPEMD160)
-            hash  = padding <> hash'
+            hash' = BS.pack $ BA.unpack (Crypto.hash input' :: Digest RIPEMD160)
+            hash  = ConcreteBuffer $ padding <> hash'
           in do
             assign (state . stack) (1 : xs)
             assign (state . returndata) hash
@@ -1259,19 +1348,23 @@ executePrecompile fees preCompileAddr gasCap inOffset inSize outOffset outSize x
 
         -- MODEXP
         0x5 ->
-          let
-            (lenb, lene, lenm) = parseModexpLength input
+         -- TODO: support symbolic variant
+         forceConcreteBuffer input $ \input' ->
 
-            output = case (isZero (96 + lenb + lene) lenm input) of
-              True ->
-                truncpad (num lenm) (asBE (0 :: Int))
-              False ->
-                let
-                  b = asInteger $ lazySlice 96 lenb input
-                  e = asInteger $ lazySlice (96 + lenb) lene input
-                  m = asInteger $ lazySlice (96 + lenb + lene) lenm input
-                in
-                  padLeft (num lenm) (asBE (expFast b e m))
+          let
+            (lenb, lene, lenm) = parseModexpLength input'
+
+            output = ConcreteBuffer $
+              case (isZero (96 + lenb + lene) lenm input') of
+                 True ->
+                   truncpadlit (num lenm) (asBE (0 :: Int))
+                 False ->
+                   let
+                     b = asInteger $ lazySlice 96 lenb $ input'
+                     e = asInteger $ lazySlice (96 + lenb) lene $ input'
+                     m = asInteger $ lazySlice (96 + lenb + lene) lenm $ input'
+                   in
+                     padLeft (num lenm) (asBE (expFast b e m))
           in do
             assign (state . stack) (1 : xs)
             assign (state . returndata) output
@@ -1279,53 +1372,68 @@ executePrecompile fees preCompileAddr gasCap inOffset inSize outOffset outSize x
             next
 
         -- ECADD
-        0x6 -> case EVM.Precompiled.execute 0x6 (truncpad 128 input) 64 of
+        0x6 ->
+         -- TODO: support symbolic variant
+         forceConcreteBuffer input $ \input' ->
+           case EVM.Precompiled.execute 0x6 (truncpadlit 128 input') 64 of
           Nothing -> precompileFail
           Just output -> do
-            let truncpaddedOutput = truncpad 64 output
+            let truncpaddedOutput = ConcreteBuffer $ truncpadlit 64 output
             assign (state . stack) (1 : xs)
             assign (state . returndata) truncpaddedOutput
             copyBytesToMemory truncpaddedOutput outSize 0 outOffset
             next
 
         -- ECMUL
-        0x7 -> case EVM.Precompiled.execute 0x7 (truncpad 96 input) 64 of
+        0x7 ->
+         -- TODO: support symbolic variant
+         forceConcreteBuffer input $ \input' ->
+
+          case EVM.Precompiled.execute 0x7 (truncpadlit 96 input') 64 of
           Nothing -> precompileFail
           Just output -> do
-            let truncpaddedOutput = truncpad 64 output
+            let truncpaddedOutput = ConcreteBuffer $ truncpadlit 64 output
             assign (state . stack) (1 : xs)
             assign (state . returndata) truncpaddedOutput
             copyBytesToMemory truncpaddedOutput outSize 0 outOffset
             next
 
         -- ECPAIRING
-        0x8 -> case EVM.Precompiled.execute 0x8 input 32 of
+        0x8 ->
+         -- TODO: support symbolic variant
+         forceConcreteBuffer input $ \input' ->
+
+          case EVM.Precompiled.execute 0x8 input' 32 of
           Nothing -> precompileFail
           Just output -> do
-            let truncpaddedOutput = truncpad 32 output
+            let truncpaddedOutput = ConcreteBuffer $ truncpadlit 32 output
             assign (state . stack) (1 : xs)
             assign (state . returndata) truncpaddedOutput
             copyBytesToMemory truncpaddedOutput outSize 0 outOffset
             next
 
         -- BLAKE2
-        0x9 -> case (BS.length input, 1 >= BS.last input) of
-          (213, True) -> case EVM.Precompiled.execute 0x9 input 64 of
-            Just output -> do
-              let truncpaddedOutput = truncpad 64 output
-              assign (state . stack) (1 : xs)
-              assign (state . returndata) truncpaddedOutput
-              copyBytesToMemory truncpaddedOutput outSize 0 outOffset
-              next
-            Nothing -> precompileFail
-          _ -> precompileFail
+        0x9 ->
+         -- TODO: support symbolic variant
+         forceConcreteBuffer input $ \input' -> do
+
+          case (BS.length input', 1 >= BS.last input') of
+            (213, True) -> case EVM.Precompiled.execute 0x9 input' 64 of
+              Just output -> do
+                let truncpaddedOutput = ConcreteBuffer $ truncpadlit 64 output
+                assign (state . stack) (1 : xs)
+                assign (state . returndata) truncpaddedOutput
+                copyBytesToMemory truncpaddedOutput outSize 0 outOffset
+                next
+              Nothing -> precompileFail
+            _ -> precompileFail
 
 
         _   -> notImplemented
 
-truncpad :: Int -> ByteString -> ByteString
-truncpad n xs = if m > n then BS.take n xs
-                     else BS.append xs (BS.replicate (n - m) 0)
+truncpadlit :: Int -> ByteString -> ByteString
+truncpadlit n xs = if m > n then BS.take n xs
+                   else BS.append xs (BS.replicate (n - m) 0)
   where m = BS.length xs
 
 lazySlice :: Word -> Word -> ByteString -> LS.ByteString
@@ -1363,6 +1471,40 @@ pushTo f x = f %= (x :)
 pushToSequence :: MonadState s m => ASetter s s (Seq a) (Seq a) -> a -> m ()
 pushToSequence f x = f %= (Seq.|> x)
 
+askSMT :: Addr -> Int -> SymWord -> (Word -> EVM ()) -> EVM ()
+askSMT addr pcval jumpcondition continue = do
+  -- We keep track of how many times we have come across this particular
+  -- (contract, pc) combination in the `iteration` mapping.
+  iteration <- use (iterations . at (addr, pcval) . non 0)
+
+  -- If we are backstepping, the result of this query should be cached
+  -- already. So we first check the cache to see if the result is known
+  use (cache . path . at ((addr, pcval), iteration)) >>= \case
+     -- If the query has been done already, select path or select the only available
+     Just w -> choosePath w
+     -- If this is a new query, run the query, cache the result
+     -- increment the iterations and select appropriate path
+     Nothing -> do pathconds <- use pathConditions
+                   assign result . Just . VMFailure . Query $ PleaseAskSMT
+                     jumpcondition pathconds choosePath
+
+   where -- Only one path is possible
+         choosePath (Known w) = do assign result Nothing
+                                   iteration <- use (iterations . at (addr, pcval) . non 0)
+                                   assign (cache . path . at ((addr, pcval), iteration)) (Just (Known w))
+                                   assign (iterations . at (addr, pcval)) (Just (iteration + 1))
+                                   continue w
+         -- Both paths are possible; we ask for more input
+         choosePath Unknown = assign result . Just . VMFailure . Choose $ PleaseChoosePath
+           (\selected -> do
+               pathConditions <>= [litWord selected .== jumpcondition]
+               iteration <- use (iterations . at (addr, pcval) . non 0)
+               assign (cache . path . at ((addr, pcval), iteration)) (Just (Known selected))
+               assign result Nothing
+               assign (iterations . at (addr, pcval)) (Just (iteration + 1))
+               continue selected)
+
+
 fetchAccount :: Addr -> (Contract -> EVM ()) -> EVM ()
 fetchAccount addr continue =
   use (env . contracts . at addr) >>= \case
@@ -1385,15 +1527,24 @@ fetchAccount addr continue =
         then vmError . NoSuchContract $ addr
         else continue c
 
+readStorage :: Storage -> SymWord -> Maybe (SymWord)
+readStorage (Symbolic s) (S _ loc) = Just . sw256 $ readArray s loc
+readStorage (Concrete s) loc = Map.lookup (forceLit loc) s
+
+writeStorage :: SymWord -> SymWord -> Storage -> Storage
+writeStorage (S _ loc) (S _ val) (Symbolic s) = Symbolic (writeArray s loc val)
+writeStorage loc val (Concrete s) = Concrete (Map.insert (forceLit loc) val s)
+
 accessStorage
-  :: Addr             -- ^ Contract address
-  -> Word             -- ^ Storage slot key
-  -> (Word -> EVM ()) -- ^ Continuation
+  :: Addr                -- ^ Contract address
+  -> SymWord             -- ^ Storage slot key
+  -> (SymWord -> EVM ()) -- ^ Continuation
   -> EVM ()
 accessStorage addr slot continue =
   use (env . contracts . at addr) >>= \case
     Just c ->
-      case view (storage . at slot) c of
+      case readStorage (view storage c) slot of
+        -- Notice that if storage is symbolic, we always continue straight away
         Just x ->
           continue x
         Nothing ->
@@ -1403,19 +1554,19 @@ accessStorage addr slot continue =
             use (cache . fetched . at addr) >>= \case
               Nothing -> mkQuery
               Just cachedContract ->
-                maybe mkQuery continue (view (storage . at slot) cachedContract)
+                maybe mkQuery continue (readStorage (view storage cachedContract) slot)
           else do
-            assign (env . contracts . ix addr . storage . at slot) (Just 0)
+            modifying (env . contracts . ix addr . storage) (writeStorage slot 0)
             continue 0
     Nothing ->
       fetchAccount addr $ \_ ->
         accessStorage addr slot continue
   where
       mkQuery = assign result . Just . VMFailure . Query $
-                  PleaseFetchSlot addr slot
-                    (\x -> do
-                        assign (cache . fetched . ix addr . storage . at slot) (Just x)
-                        assign (env . contracts . ix addr . storage . at slot) (Just x)
+                  PleaseFetchSlot addr (forceLit slot)
+                    (\(litWord -> x) -> do
+                        modifying (cache . fetched . ix addr . storage) (writeStorage slot x)
+                        modifying (env . contracts . ix addr . storage) (writeStorage slot x)
                         assign result Nothing
                         continue x)
 
@@ -1455,43 +1606,40 @@ finalize = do
       creation <- use (tx . isCreate)
       createe  <- use (state . contract)
       createeExists <- (Map.member createe) <$> use (env . contracts)
-      if (creation && createeExists)
-      then replaceCode createe (RuntimeCode output)
+
+      if creation && createeExists
+      then forceConcreteBuffer output $ \code' -> replaceCode createe (RuntimeCode code')
       else noop
 
-  use execMode >>= \case
-    ExecuteAsVMTest ->
-      noop
-    _ -> do
-      -- compute and pay the refund to the caller and the
-      -- corresponding payment to the miner
-      txOrigin     <- use (tx . origin)
-      sumRefunds   <- (sum . (snd <$>)) <$> (use (tx . substate . refunds))
-      miner        <- use (block . coinbase)
-      blockReward  <- r_block <$> (use (block . schedule))
-      gasPrice     <- use (tx . gasprice)
-      gasLimit     <- use (tx . txgaslimit)
-      gasRemaining <- use (state . gas)
+  -- compute and pay the refund to the caller and the
+  -- corresponding payment to the miner
+  txOrigin     <- use (tx . origin)
+  sumRefunds   <- (sum . (snd <$>)) <$> (use (tx . substate . refunds))
+  miner        <- use (block . coinbase)
+  blockReward  <- r_block <$> (use (block . schedule))
+  gasPrice     <- use (tx . gasprice)
+  gasLimit     <- use (tx . txgaslimit)
+  gasRemaining <- use (state . gas)
 
-      let
-        gasUsed      = gasLimit - gasRemaining
-        cappedRefund = min (quot gasUsed 2) sumRefunds
-        originPay    = (gasRemaining + cappedRefund) * gasPrice
-        minerPay     = gasPrice * (gasUsed - cappedRefund)
+  let
+    gasUsed      = gasLimit - gasRemaining
+    cappedRefund = min (quot gasUsed 2) sumRefunds
+    originPay    = (gasRemaining + cappedRefund) * gasPrice
+    minerPay     = gasPrice * (gasUsed - cappedRefund)
 
-      modifying (env . contracts)
-        (Map.adjust (over balance (+ originPay)) txOrigin)
-      modifying (env . contracts)
-        (Map.adjust (over balance (+ minerPay)) miner)
-      touchAccount miner
+  modifying (env . contracts)
+     (Map.adjust (over balance (+ originPay)) txOrigin)
+  modifying (env . contracts)
+     (Map.adjust (over balance (+ minerPay)) miner)
+  touchAccount miner
 
-      -- pay out the block reward, recreating the miner if necessary
-      preuse (env . contracts . ix miner) >>= \case
-        Nothing -> modifying (env . contracts)
-          (Map.insert miner (initialContract (EVM.RuntimeCode mempty)))
-        Just _  -> noop
-      modifying (env . contracts)
-        (Map.adjust (over balance (+ blockReward)) miner)
+  -- pay out the block reward, recreating the miner if necessary
+  preuse (env . contracts . ix miner) >>= \case
+    Nothing -> modifying (env . contracts)
+      (Map.insert miner (initialContract (EVM.RuntimeCode mempty)))
+    Just _  -> noop
+  modifying (env . contracts)
+    (Map.adjust (over balance (+ blockReward)) miner)
 
   -- perform state trie clearing (EIP 161), of selfdestructs
   -- and touched accounts. addresses are cleared if they have
@@ -1550,6 +1698,47 @@ burn n continue = do
     else
       vmError (OutOfGas available n)
 
+forceConcreteAddr :: SAddr -> (Addr -> EVM ()) -> EVM ()
+forceConcreteAddr n continue = case maybeLitAddr n of
+  Nothing -> vmError UnexpectedSymbolicArg
+  Just c -> continue c
+
+forceConcrete :: SymWord -> (Word -> EVM ()) -> EVM ()
+forceConcrete n continue = case maybeLitWord n of
+  Nothing -> vmError UnexpectedSymbolicArg
+  Just c -> continue c
+
+forceConcrete2 :: (SymWord, SymWord) -> ((Word, Word) -> EVM ()) -> EVM ()
+forceConcrete2 (n,m) continue = case (maybeLitWord n, maybeLitWord m) of
+  (Just c, Just d) -> continue (c, d)
+  _ -> vmError UnexpectedSymbolicArg
+
+forceConcrete3 :: (SymWord, SymWord, SymWord) -> ((Word, Word, Word) -> EVM ()) -> EVM ()
+forceConcrete3 (k,n,m) continue = case (maybeLitWord k, maybeLitWord n, maybeLitWord m) of
+  (Just c, Just d, Just f) -> continue (c, d, f)
+  _ -> vmError UnexpectedSymbolicArg
+
+forceConcrete4 :: (SymWord, SymWord, SymWord, SymWord) -> ((Word, Word, Word, Word) -> EVM ()) -> EVM ()
+forceConcrete4 (k,l,n,m) continue = case (maybeLitWord k, maybeLitWord l, maybeLitWord n, maybeLitWord m) of
+  (Just b, Just c, Just d, Just f) -> continue (b, c, d, f)
+  _ -> vmError UnexpectedSymbolicArg
+
+forceConcrete5 :: (SymWord, SymWord, SymWord, SymWord, SymWord) -> ((Word, Word, Word, Word, Word) -> EVM ()) -> EVM ()
+forceConcrete5 (k,l,m,n,o) continue = case (maybeLitWord k, maybeLitWord l, maybeLitWord m, maybeLitWord n, maybeLitWord o) of
+  (Just a, Just b, Just c, Just d, Just e) -> continue (a, b, c, d, e)
+  _ -> vmError UnexpectedSymbolicArg
+
+forceConcrete6 :: (SymWord, SymWord, SymWord, SymWord, SymWord, SymWord) -> ((Word, Word, Word, Word, Word, Word) -> EVM ()) -> EVM ()
+forceConcrete6 (k,l,m,n,o,p) continue = case (maybeLitWord k, maybeLitWord l, maybeLitWord m, maybeLitWord n, maybeLitWord o, maybeLitWord p) of
+  (Just a, Just b, Just c, Just d, Just e, Just f) -> continue (a, b, c, d, e, f)
+  _ -> vmError UnexpectedSymbolicArg
+
+forceConcreteBuffer :: Buffer -> (ByteString -> EVM ()) -> EVM ()
+forceConcreteBuffer (SymbolicBuffer b) continue = case maybeLitBytes b of
+  Nothing -> vmError UnexpectedSymbolicArg
+  Just bs -> continue bs
+forceConcreteBuffer (ConcreteBuffer b) continue = continue b
+
 -- * Substate manipulation
 refund :: Word -> EVM ()
 refund n = do
@@ -1584,32 +1773,35 @@ cheat
   -> EVM ()
 cheat (inOffset, inSize) (outOffset, outSize) = do
   mem <- use (state . memory)
+  vm <- get
   let
-    abi =
-      num (wordValue (readMemoryWord32 inOffset mem))
-    input =
-      sliceMemory (inOffset + 4) (inSize - 4) mem
-  case Map.lookup abi cheatActions of
-    Nothing ->
-      vmError (BadCheatCode abi)
-    Just (argTypes, action) ->
-      case runGetOrFail
-             (getAbiSeq (length argTypes) argTypes)
-             (fromStrict input) of
-        Right ("", _, args) ->
-          action (toList args) >>= \case
-            Nothing -> do
-              next
-              push 1
-            Just (encodeAbiValue -> bs) -> do
-              next
-              modifying (state . memory)
-                (writeMemory bs outSize 0 outOffset)
-              push 1
-        Left _ ->
-          vmError (BadCheatCode abi)
-        Right _ ->
-          vmError (BadCheatCode abi)
+    abi = readMemoryWord32 inOffset mem
+    input = readMemory (inOffset + 4) (inSize - 4) vm
+  case fromSized <$> unliteral abi of
+    Nothing -> vmError UnexpectedSymbolicArg
+    Just abi -> 
+              case Map.lookup abi cheatActions of
+                Nothing ->
+                  vmError (BadCheatCode (Just abi))
+                Just (argTypes, action) ->
+                  case input of
+                    SymbolicBuffer _ -> vmError UnexpectedSymbolicArg
+                    ConcreteBuffer input' ->
+                      case runGetOrFail
+                             (getAbiSeq (length argTypes) argTypes)
+                             (LS.fromStrict input') of
+                        Right ("", _, args) ->
+                          action (toList args) >>= \case
+                            Nothing -> do
+                              next
+                              push 1
+                            Just (encodeAbiValue -> bs) -> do
+                              next
+                              modifying (state . memory)
+                                (writeMemory (ConcreteBuffer bs) outSize 0 outOffset)
+                              push 1
+                        _ ->
+                          vmError (BadCheatCode (Just abi))
 
 type CheatAction = ([AbiType], [AbiValue] -> EVM (Maybe AbiValue))
 
@@ -1619,83 +1811,72 @@ cheatActions =
     [ action "warp(uint256)" [AbiUIntType 256] $
         \[AbiUInt 256 x] -> do
           assign (block . timestamp) (w256 (W256 x))
+          return Nothing,
+      action "store(address,bytes32,bytes32)" [AbiAddressType, AbiBytesType 32, AbiBytesType 32] $
+        \[AbiAddress a, AbiBytes 32 x, AbiBytes 32 y] -> do
+          let slot = w256lit $ word x
+              new  = w256lit $ word y
+          fetchAccount a $ \_ -> do
+            modifying (env . contracts . ix a . storage) (writeStorage slot new)
           return Nothing
     ]
   where
     action s ts f = (abiKeccak s, (ts, f))
 
-
 -- * General call implementation ("delegateCall")
 delegateCall
   :: (?op :: Word8)
-  => Contract -> Word -> Addr -> Word -> Word -> Word -> Word -> Word -> [Word]
+  => Contract -> Word -> Addr -> Addr -> Word -> Word -> Word -> Word -> Word -> [SymWord]
   -> EVM ()
   -> EVM ()
-delegateCall this xGas xTo xValue xInOffset xInSize xOutOffset xOutSize xs continue = do
-  vm0 <- get
-  if xValue > view balance this
-  then do
-    assign (state . stack) (0 : xs)
-    assign (state . returndata) mempty
-    pushTrace $ ErrorTrace $ BalanceTooLow xValue (view balance this)
-    next
-  else if length (view frames vm0) >= 1024
-  then do
-    assign (state . stack) (0 : xs)
-    assign (state . returndata) mempty
-    pushTrace $ ErrorTrace CallDepthLimitReached
-    next
-  else case view execMode vm0 of
-    ExecuteAsVMTest -> do
-      assign (state . stack) (1 : xs)
-      next
-    _ ->
-      fetchAccount xTo . const $
-        preuse (env . contracts . ix xTo) >>= \case
-          Nothing ->
-            vmError (NoSuchContract xTo)
-          Just target ->
-            burn xGas $ do
-              let newContext = CallContext
-                    { callContextOffset = xOutOffset
-                    , callContextSize = xOutSize
-                    , callContextCodehash = view codehash target
-                    , callContextReversion = view (env . contracts) vm0
-                    , callContextSubState = view (tx . substate) vm0
-                    , callContextAbi =
-                        if xInSize >= 4
-                        then
-                          let
-                            w = wordValue
-                                  (readMemoryWord32 xInOffset (view (state . memory) vm0))
-                          in Just $! num w
-                        else Nothing
-                    , callContextData = (readMemory (num xInOffset) (num xInSize) vm0)
-                    }
+delegateCall this gasGiven xTo xContext xValue xInOffset xInSize xOutOffset xOutSize xs continue =
+  callChecks this gasGiven xContext xValue xInOffset xInSize xOutOffset xOutSize xs $
+  \xGas -> do
+    vm0 <- get
+    fetchAccount xTo . const $
+      preuse (env . contracts . ix xTo) >>= \case
+        Nothing ->
+          vmError (NoSuchContract xTo)
+        Just target ->
+          burn xGas $ do
+            let newContext = CallContext
+                  { callContextOffset = xOutOffset
+                  , callContextSize = xOutSize
+                  , callContextCodehash = view codehash target
+                  , callContextReversion = view (env . contracts) vm0
+                  , callContextSubState = view (tx . substate) vm0
+                  , callContextAbi =
+                      if xInSize >= 4
+                      then case unliteral $ readMemoryWord32 xInOffset (view (state . memory) vm0)
+                           of Nothing -> Nothing
+                              Just abi -> Just . w256 $ num abi
+                      else Nothing
+                  , callContextData = (readMemory (num xInOffset) (num xInSize) vm0)
+                  }
+  
+            pushTrace (FrameTrace newContext)
+            next
+            vm1 <- get
+  
+            pushTo frames $ Frame
+              { _frameState = (set stack xs) (view state vm1)
+              , _frameContext = newContext
+              }
+  
+            zoom state $ do
+              assign gas xGas
+              assign pc 0
+              assign code (view bytecode target)
+              assign codeContract xTo
+              assign stack mempty
+              assign memory mempty
+              assign memorySize 0
+              assign returndata mempty
+              assign calldata (readMemory (num xInOffset) (num xInSize) vm0, literal (num xInSize))
+  
+            continue
 
-              pushTrace (FrameTrace newContext)
-              next
-              vm1 <- get
-
-              pushTo frames $ Frame
-                { _frameState = (set stack xs) (view state vm1)
-                , _frameContext = newContext
-                }
-
-              zoom state $ do
-                assign gas xGas
-                assign pc 0
-                assign code (view bytecode target)
-                assign codeContract xTo
-                assign stack mempty
-                assign memory mempty
-                assign memorySize 0
-                assign returndata mempty
-                assign calldata (readMemory (num xInOffset) (num xInSize) vm0)
-
-              continue
-
--- * Contract creation
+-- -- * Contract creation
 
 -- EIP 684
 collision :: Maybe Contract -> Bool
@@ -1705,7 +1886,7 @@ collision c' = case c' of
 
 create :: (?op :: Word8)
   => Addr -> Contract
-  -> Word -> Word -> [Word] -> Addr -> ByteString -> EVM ()
+  -> Word -> Word -> [SymWord] -> Addr -> ByteString -> EVM ()
 create self this xGas xValue xs newAddr initCode = do
   vm0 <- get
   if xValue > view balance this
@@ -1718,19 +1899,14 @@ create self this xGas xValue xs newAddr initCode = do
   then do
     assign (state . stack) (0 : xs)
     assign (state . returndata) mempty
-    pushTrace $ ErrorTrace CallDepthLimitReached
+    pushTrace $ ErrorTrace $ CallDepthLimitReached
     next
   else if collision $ view (env . contracts . at newAddr) vm0
   then burn xGas $ do
     assign (state . stack) (0 : xs)
     modifying (env . contracts . ix self . nonce) succ
     next
-  else burn xGas $
-    case (view execMode vm0) of
-      ExecuteAsVMTest -> do
-        assign (state . stack) (num newAddr : xs)
-        next
-      _ -> do
+  else burn xGas $ do
         touchAccount self
         touchAccount newAddr
         let
@@ -1742,8 +1918,6 @@ create self this xGas xValue xs newAddr initCode = do
                             , creationContextSubstate = view (tx . substate) vm0
                             }
 
-        --reset origStorage if account already existed
-        assign (tx . origStorage . at newAddr . lifted) newContract
         zoom (env . contracts) $ do
           oldAcc <- use (at newAddr)
           let oldBal = case oldAcc of
@@ -1768,8 +1942,8 @@ create self this xGas xValue xs newAddr initCode = do
             & set contract   newAddr
             & set codeContract newAddr
             & set code       initCode
-            & set callvalue  xValue
-            & set caller     self
+            & set callvalue  (litWord xValue)
+            & set caller     (litAddr self)
             & set gas        xGas
 
 -- | Replace a contract's code, like when CREATE returns
@@ -1812,8 +1986,8 @@ underrun = vmError StackUnderrun
 
 -- | A stack frame can be popped in three ways.
 data FrameResult
-  = FrameReturned ByteString -- ^ STOP, RETURN, or no more code
-  | FrameReverted ByteString -- ^ REVERT
+  = FrameReturned Buffer -- ^ STOP, RETURN, or no more code
+  | FrameReverted Buffer -- ^ REVERT
   | FrameErrored Error -- ^ Any other error
   deriving Show
 
@@ -1832,13 +2006,10 @@ finishFrame how = do
       assign result . Just $
         case how of
           FrameReturned output -> VMSuccess output
-          FrameReverted output -> VMFailure (Revert output)
+          FrameReverted (ConcreteBuffer output) -> VMFailure (Revert output)
+          FrameReverted (SymbolicBuffer output) -> VMFailure (Revert (forceLitBytes output))
           FrameErrored e       -> VMFailure e
-      use execMode >>= \case
-        ExecuteNormally ->
-          noop
-        _ ->
-          finalize
+      finalize
 
     -- Are there some remaining frames?
     nextFrame : remainingFrames -> do
@@ -1852,8 +2023,10 @@ finishFrame how = do
         case how of
           FrameErrored e ->
             ErrorTrace e
-          FrameReverted output ->
+          FrameReverted (ConcreteBuffer output) ->
             ErrorTrace (Revert output)
+          FrameReverted (SymbolicBuffer output) ->
+            ErrorTrace (Revert (forceLitBytes output))
           FrameReturned output ->
             ReturnTrace output (view frameContext nextFrame)
       -- Pop to the previous level of the debug trace stack.
@@ -1917,11 +2090,12 @@ finishFrame how = do
 
           case how of
             -- Case 4: Returning during a creation?
-            FrameReturned output -> do
-              replaceCode createe (RuntimeCode output)
-              assign (state . returndata) mempty
-              reclaimRemainingGasAllowance
-              push (num createe)
+            FrameReturned output ->
+              forceConcreteBuffer output $ \output' -> do
+                replaceCode createe (RuntimeCode output')
+                assign (state . returndata) mempty
+                reclaimRemainingGasAllowance
+                push (num createe)
 
             -- Case 5: Reverting during a creation?
             FrameReverted output -> do
@@ -1973,7 +2147,7 @@ accessMemoryWord
 accessMemoryWord fees x = accessMemoryRange fees x 32
 
 copyBytesToMemory
-  :: ByteString -> Word -> Word -> Word -> EVM ()
+  :: Buffer -> Word -> Word -> Word -> EVM ()
 copyBytesToMemory bs size xOffset yOffset =
   if size == 0 then noop
   else do
@@ -1982,21 +2156,21 @@ copyBytesToMemory bs size xOffset yOffset =
       writeMemory bs size xOffset yOffset mem
 
 copyCallBytesToMemory
-  :: ByteString -> Word -> Word -> Word -> EVM ()
+  :: Buffer -> Word -> Word -> Word -> EVM ()
 copyCallBytesToMemory bs size xOffset yOffset =
   if size == 0 then noop
   else do
     mem <- use (state . memory)
     assign (state . memory) $
-      writeMemory bs (min size (num (BS.length bs))) xOffset yOffset mem
+      writeMemory bs (min size (num (len bs))) xOffset yOffset mem
 
-readMemory :: Word -> Word -> VM -> ByteString
-readMemory offset size vm = sliceMemory offset size (view (state . memory) vm)
+readMemory :: Word -> Word -> VM -> Buffer
+readMemory offset size vm = sliceWithZero (num offset) (num size) (view (state . memory) vm)
 
 word256At
   :: Functor f
-  => Word -> (Word -> f Word)
-  -> ByteString -> f ByteString
+  => Word -> (SymWord -> f (SymWord))
+  -> Buffer -> f Buffer
 word256At i = lens getter setter where
   getter = readMemoryWord i
   setter m x = setMemoryWord i x m
@@ -2053,12 +2227,16 @@ traceLog log = do
 -- * Stack manipulation
 
 push :: Word -> EVM ()
-push x = state . stack %= (x :)
+push = pushSym . w256lit . num
+
+pushSym :: SymWord -> EVM ()
+pushSym x = state . stack %= (x :)
+
 
 stackOp1
   :: (?op :: Word8)
-  => (Word -> Word)
-  -> (Word -> Word)
+  => ((SymWord) -> Word)
+  -> ((SymWord) -> (SymWord))
   -> EVM ()
 stackOp1 cost f =
   use (state . stack) >>= \case
@@ -2072,8 +2250,8 @@ stackOp1 cost f =
 
 stackOp2
   :: (?op :: Word8)
-  => ((Word, Word) -> Word)
-  -> ((Word, Word) -> Word)
+  => (((SymWord), (SymWord)) -> Word)
+  -> (((SymWord), (SymWord)) -> (SymWord))
   -> EVM ()
 stackOp2 cost f =
   use (state . stack) >>= \case
@@ -2086,8 +2264,8 @@ stackOp2 cost f =
 
 stackOp3
   :: (?op :: Word8)
-  => ((Word, Word, Word) -> Word)
-  -> ((Word, Word, Word) -> Word)
+  => (((SymWord), (SymWord), (SymWord)) -> Word)
+  -> (((SymWord), (SymWord), (SymWord)) -> (SymWord))
   -> EVM ()
 stackOp3 cost f =
   use (state . stack) >>= \case
@@ -2100,7 +2278,7 @@ stackOp3 cost f =
 
 -- * Bytecode data functions
 
-checkJump :: (Integral n) => n -> [Word] -> EVM ()
+checkJump :: (Integral n) => n -> [SymWord] -> EVM ()
 checkJump x xs = do
   theCode <- use (state . code)
   self <- use (state . codeContract)
@@ -2152,7 +2330,7 @@ vmOpIx vm =
   do self <- currentContract vm
      (view opIxMap self) Vector.!? (view (state . pc) vm)
 
-opParams :: VM -> Map String Word
+opParams :: VM -> Map String (SymWord)
 opParams vm =
   case vmOp vm of
     Just OpCreate ->
@@ -2287,9 +2465,9 @@ costOfCall (FeeSchedule {..}) recipientExists xValue availableGas xGas =
     c_extra =
       num g_call + c_xfer + c_new
     c_xfer =
-      if xValue /= 0          then num g_callvalue              else 0
+      if xValue /= 0  then num g_callvalue              else 0
     c_callgas =
-      if xValue /= 0          then c_gascap + num g_callstipend else c_gascap
+      if xValue /= 0  then c_gascap + num g_callstipend else c_gascap
     c_new =
       if not recipientExists && xValue /= 0
       then num g_newaccount
@@ -2311,28 +2489,31 @@ costOfCreate (FeeSchedule {..}) availableGas hashSize =
     initGas    = allButOne64th (availableGas - createCost)
 
 -- Gas cost of precompiles
-costOfPrecompile :: FeeSchedule Word -> Addr -> ByteString -> Word
+costOfPrecompile :: FeeSchedule Word -> Addr -> Buffer -> Word
 costOfPrecompile (FeeSchedule {..}) precompileAddr input =
   case precompileAddr of
     -- ECRECOVER
     0x1 -> 3000
     -- SHA2-256
-    0x2 -> num $ (((BS.length input + 31) `div` 32) * 12) + 60
+    0x2 -> num $ (((len input + 31) `div` 32) * 12) + 60
     -- RIPEMD-160
-    0x3 -> num $ (((BS.length input + 31) `div` 32) * 120) + 600
+    0x3 -> num $ (((len input + 31) `div` 32) * 120) + 600
     -- IDENTITY
-    0x4 -> num $ (((BS.length input + 31) `div` 32) * 3) + 15
+    0x4 -> num $ (((len input + 31) `div` 32) * 3) + 15
     -- MODEXP
     0x5 -> num $ (f (num (max lenm lenb)) * num (max lene' 1)) `div` (num g_quaddivisor)
-      where (lenb, lene, lenm) = parseModexpLength input
+      where input' = case input of
+              SymbolicBuffer _ -> error "unsupported: symbolic MODEXP gas cost calc"
+              ConcreteBuffer b -> b
+            (lenb, lene, lenm) = parseModexpLength input'
             lene' | lene <= 32 && ez = 0
                   | lene <= 32 = num (log2 e')
                   | e' == 0 = 8 * (lene - 32)
                   | otherwise = num (log2 e') + 8 * (lene - 32)
 
-            ez = isZero (96 + lenb) lene input
+            ez = isZero (96 + lenb) lene input'
             e' = w256 $ word $ LS.toStrict $
-                   lazySlice (96 + lenb) (min 32 lene) input
+                   lazySlice (96 + lenb) (min 32 lene) input'
 
             f :: Integer -> Integer
             f x | x <= 64 = x * x
@@ -2343,9 +2524,12 @@ costOfPrecompile (FeeSchedule {..}) precompileAddr input =
     -- ECMUL
     0x7 -> g_ecmul
     -- ECPAIRING
-    0x8 -> num $ ((BS.length input) `div` 192) * (num g_pairing_point) + (num g_pairing_base)
+    0x8 -> num $ ((len input) `div` 192) * (num g_pairing_point) + (num g_pairing_base)
     -- BLAKE2
-    0x9 -> g_fround * (num $ asInteger $ lazySlice 0 4 input)
+    0x9 -> let input' = case input of
+                         SymbolicBuffer _ -> error "unsupported: symbolic BLAKE2B gas cost calc"
+                         ConcreteBuffer b -> b
+           in g_fround * (num $ asInteger $ lazySlice 0 4 input')
     _ -> error ("unimplemented precompiled contract " ++ show precompileAddr)
 
 -- Gas cost of memory expansion
@@ -2357,6 +2541,33 @@ memoryCost FeeSchedule{..} byteCount =
     quadraticCost = div (wordCount * wordCount) 512
   in
     linearCost + quadraticCost
+
+-- * Uninterpreted functions
+
+symSHA256N :: SInteger -> SInteger -> SWord 256
+symSHA256N = uninterpret "sha256"
+
+symkeccakN :: SInteger -> SInteger -> SWord 256
+symkeccakN = uninterpret "keccak"
+
+toSInt :: [SWord 8] -> SInteger
+toSInt bs = sum $ zipWith (\a i -> sFromIntegral $ a * 256 ^ i) bs [0..]
+
+
+-- | Although we'd like to define this directly as an uninterpreted function,
+-- we cannot because [a] is not a symbolic type. We must convert the list into a suitable
+-- symbolic type first. The only important property of this conversion is that it is injective.
+-- We embedd the bytestring as a pair of symbolic integers, this is a fairly easy solution.
+symkeccak' :: [SWord 8] -> SWord 256
+symkeccak' bytes = case length bytes of
+  0 -> literal $ toSizzle $ keccak ""
+  n -> symkeccakN (num n) (toSInt bytes)
+
+symSHA256 :: [SWord 8] -> [SWord 8]
+symSHA256 bytes = case length bytes of
+  0 -> litBytes $ BS.pack $ BA.unpack $ (Crypto.hash BS.empty :: Digest SHA256)
+  n -> toBytes $ symSHA256N (num n) (toSInt bytes)
+
 
 -- * Arithmetic
 

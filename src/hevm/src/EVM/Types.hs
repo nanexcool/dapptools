@@ -1,5 +1,9 @@
 {-# Language CPP #-}
 {-# Language TemplateHaskell #-}
+{-# LANGUAGE TypeFamilies #-}
+{-# LANGUAGE DataKinds #-}
+{-# LANGUAGE DefaultSignatures #-}
+{-# LANGUAGE FlexibleInstances #-}
 
 module EVM.Types where
 
@@ -9,12 +13,11 @@ import Data.Aeson (FromJSON (..), (.:))
 import Data.Aeson (FromJSONKey (..), FromJSONKeyFunction (..))
 #endif
 
-import Text.ParserCombinators.ReadP
+import Data.SBV
+import Data.Kind
 import Data.Monoid ((<>))
 import Data.Bifunctor (first)
-import Data.Bits
 import Data.Char
-import Data.ByteString.Internal
 import Data.ByteString (ByteString)
 import Data.ByteString.Base16 as BS16
 import Data.ByteString.Builder (byteStringHex, toLazyByteString)
@@ -45,11 +48,47 @@ mkUnpackedDoubleWord "Word512" ''Word256 "Int512" ''Int256 ''Word256
 newtype W256 = W256 Word256
   deriving
     ( Num, Integral, Real, Ord, Enum, Eq
-    , Bits, FiniteBits, Generic
+    , Bits, FiniteBits, Bounded, Generic
     )
+
+-- | convert between (WordN 256) and Word256
+type family ToSizzle (t :: Type) :: Type where
+    ToSizzle W256 = (WordN 256)
+    ToSizzle Addr = (WordN 160)
+
+-- | Conversion from a fixed-sized BV to a sized bit-vector.
+class ToSizzleBV a where
+   -- | Convert a fixed-sized bit-vector to the corresponding sized bit-vector,
+   toSizzle :: a -> ToSizzle a
+
+   default toSizzle :: (Num (ToSizzle a), Integral a) => (a -> ToSizzle a)
+   toSizzle = fromIntegral
+
+-- | Capture the correspondence between sized and fixed-sized BVs
+type family FromSizzle (t :: Type) :: Type where
+   FromSizzle (WordN 256) = W256
+   FromSizzle (WordN 160) = Addr
+
+
+-- | Conversion from a sized BV to a fixed-sized bit-vector.
+class FromSizzleBV a where
+   -- | Convert a sized bit-vector to the corresponding fixed-sized bit-vector,
+   -- for instance 'SWord 16' to 'SWord16'. See also 'toSized'.
+   fromSizzle :: a -> FromSizzle a
+
+   default fromSizzle :: (Num (FromSizzle a), Integral a) => a -> FromSizzle a
+   fromSizzle = fromIntegral
+ 
+instance (ToSizzleBV W256)
+instance (FromSizzleBV (WordN 256))
+instance (ToSizzleBV Addr)
+instance (FromSizzleBV (WordN 160))
 
 newtype Addr = Addr { addressWord160 :: Word160 }
   deriving (Num, Integral, Real, Ord, Enum, Eq, Bits, Generic)
+
+newtype SAddr = SAddr { saddressWord160 :: SWord 160 }
+  deriving (Num)
 
 instance Read W256 where
   readsPrec _ "0x" = [(0, "")]
@@ -65,10 +104,12 @@ instance Read Addr where
 instance Show Addr where
   showsPrec _ s a =
     let h = showHex s a
-    in replicate (40 - length h) '0' ++ h
+    in "0x" ++ replicate (40 - length h) '0' ++ h
 
-showAddrWith0x :: Addr -> String
-showAddrWith0x addr = "0x" ++ show addr
+instance Show SAddr where
+  show (SAddr a) = case unliteral a of
+    Nothing -> "<symbolic addr>"
+    Just c -> show c
 
 strip0x :: ByteString -> ByteString
 strip0x bs = if "0x" `Char8.isPrefixOf` bs then Char8.drop 2 bs else bs
@@ -82,7 +123,7 @@ instance Show ByteStringS where
         Text.decodeUtf8 . toStrict . toLazyByteString . byteStringHex
 
 instance Read ByteStringS where
-    readsPrec n ('0':'x':x) = [(ByteStringS $ fst bytes, Text.unpack . Text.decodeUtf8 $ snd bytes)]
+    readsPrec _ ('0':'x':x) = [(ByteStringS $ fst bytes, Text.unpack . Text.decodeUtf8 $ snd bytes)]
        where bytes = BS16.decode (Text.encodeUtf8 (Text.pack x))
     readsPrec _ _ = []
 
@@ -172,6 +213,12 @@ padLeft n xs = BS.replicate (n - BS.length xs) 0 <> xs
 
 padRight :: Int -> ByteString -> ByteString
 padRight n xs = xs <> BS.replicate (n - BS.length xs) 0
+
+truncpad :: Int -> [SWord 8] -> [SWord 8]
+truncpad n xs = if m > n then take n xs
+                else mappend xs (replicate (n - m) 0)
+  where m = length xs
+
 
 word :: ByteString -> W256
 word xs = case Cereal.runGet m (padLeft 32 xs) of

@@ -5,76 +5,27 @@ let
   stdenv = self.pkgs.stdenv;
 
 in rec {
+  dapptoolsSrc = self.callPackage (import ./nix/dapptools-src.nix) {};
+
   haskellPackages = super.haskellPackages.override (old: {
     overrides = lib.composeExtensions (old.overrides or (_: _: {})) (
       import ./haskell.nix { inherit lib; pkgs = self; }
     );
   });
 
-  profilingHaskellPackages = self.haskellPackages.extend (
-    self: super-hs: {
-      mkDerivation = args: super-hs.mkDerivation
-        (args // { enableLibraryProfiling = true; });
-    }
-  );
-
-  callSolidityPackage = self.lib.callPackageWith {
-    inherit (self) solidityPackage dappsys;
-  };
-
-  dappsys = self.callPackage (
-    self.pkgs.fetchFromGitHub {
-      owner = "dapphub";
-      repo = "dappsys";
-      rev = "933fb468f72f1a81ee8b6d90b17ffdf25d8e1067";
-      sha256 = "06k5j597y4i1q6zcpqxzbflzq6qp62nrnjs6slh7vk70wjccrbh9";
-      fetchSubmodules = true;
-    }
-  ) {};
-
   solidityPackage = import ./nix/solidity-package.nix {
     inherit (self) pkgs;
   };
 
-  # A merged Dappsys to act as the DAPPSYS_PATH for dapp-tests.
-  dappsys-merged = self.symlinkJoin {
-    name = "dappsys";
-    paths = map builtins.toString (lib.attrVals [
-      "ds-test"
-      "ds-auth"
-      "ds-math"
-    ] dappsys);
-  };
+  # experimental dapp builder, allows for easy overriding of phases
+  buildDappPackage = import ./nix/build-dapp-package.nix { inherit (self) pkgs; };
 
-  # Here we can make e.g. integration tests for Dappsys,
-  # or tests that verify Hevm correctness, etc.
-  dapp-tests = stdenv.mkDerivation {
-    name = "dapp-tests";
-    src = ./src/dapp-tests;
-    installPhase = "true";
-    buildInputs = [self.dapp];
-    buildPhase = ''
-      set -e
-      export DAPPSYS_PATH=${dappsys-merged}/dapp
-      ls "$DAPPSYS_PATH"
-      echo "$PATH"
-      patchShebangs .
-      make
-      mkdir "$out"
-    '';
-  };
+  # Here we can make e.g. integration tests for Dappsys.
+  dapp-tests = import ./src/dapp-tests { inherit (self) pkgs; };
 
-  dapps = {
-    maker-otc = import (self.pkgs.fetchFromGitHub {
-      owner = "makerdao";
-      repo = "maker-otc";
-      rev = "513f102ad20129ea76e5c9b79afaa18693f63b88";
-      sha256 = "0jpdanhihv94yw3ay8dfcbv7l1dg30rfbdxq9lshm0hg94mblb6l";
-    }) self.pkgs;
-  };
-
-  known-contracts = import ./nix/known-contracts.nix;
-  dapp-which = self.callPackage ./nix/dapp-which.nix {};
+  # These are tests that verify the correctness of hevm symbolic using various
+  # external test suites (e.g. the solc tests)
+  hevm-tests = import ./nix/hevm-tests { pkgs = self.pkgs; };
 
   bashScript = { name, version ? "0", deps ? [], text, check ? true } :
     self.pkgs.writeTextFile {
@@ -101,20 +52,20 @@ in rec {
 
   solc-versions =
     let
-      fetchNixpkgs = { owner, attr }:
+      fetchSolcVersions = { owner, attr }:
         super.lib.mapAttrs
-          (_: nixpkgs: importSolc { inherit owner; inherit (nixpkgs) rev sha256; })
+          (_: nixpkgs: (importNixpkgs { inherit owner; inherit (nixpkgs) rev sha256; }).solc)
           (builtins.getAttr attr (import ./nix/solc-versions.nix));
-      importSolc = { owner, rev, sha256 }:
-        (import (self.pkgs.fetchFromGitHub {
+      importNixpkgs = { owner, rev, sha256 }:
+        import (self.pkgs.fetchFromGitHub {
           inherit owner rev sha256;
           repo = "nixpkgs";
-        }) {}).solc;
+        }) {};
       in
-        fetchNixpkgs { owner = "NixOS";   attr = super.system; }
+        fetchSolcVersions { owner = "NixOS";   attr = super.system; }
         //
-        fetchNixpkgs { owner = "dapphub"; attr = "unreleased"; };
-  solc = solc-versions.solc_0_5_15;
+        fetchSolcVersions { owner = "dapphub"; attr = "unreleased_" + super.system; };
+  solc = solc-versions.solc_0_6_7;
 
   hevm = self.pkgs.haskell.lib.justStaticExecutables self.haskellPackages.hevm;
 
@@ -124,7 +75,7 @@ in rec {
 
   jays = (
     self.pkgs.haskell.lib.justStaticExecutables
-      (self.haskellPackages.callPackage (import ./src/jays) {})
+      (self.haskellPackages.callCabal2nix "jays" (./src/jays) {})
   ).overrideAttrs (_: { postInstall = "cp $out/bin/{jays,jshon}"; });
 
   # Override buggy jshon program with Haskell-based replacement.
@@ -133,16 +84,9 @@ in rec {
   seth = self.callPackage (import ./src/seth) {};
   dapp = self.callPackage (import ./src/dapp) {};
 
-  ethsign = (self.callPackage (import ./src/ethsign) {}).bin;
-
-  evmdis = self.callPackage ./nix/evmdis.nix {};
+  ethsign = (self.callPackage (import ./src/ethsign) {});
 
   token = self.callPackage (import ./src/token) {};
-  dai = self.callPackage (import ./submodules/dai-cli) {};
-
-  setzer = self.callPackage (import ./submodules/setzer) {};
-  terra = self.callPackage (import ./submodules/terra) {};
-  chief = self.callPackage (import ./submodules/chief) {};
 
   # We use this to run private testnets without
   # the pesky transaction size limit.
@@ -187,39 +131,4 @@ in rec {
   secp256k1 = super.secp256k1.overrideDerivation (_: {
     dontDisableStatic = true;
   });
-
-  celf = self.callPackage ./nix/celf.nix {};
-
-  myetherwallet = stdenv.mkDerivation rec {
-    name = "myetherwallet-${version}";
-    version = "3.11.3.1";
-    src = self.fetchFromGitHub {
-      owner = "kvhnuke";
-      repo = "etherwallet";
-      rev = "v${version}";
-      sha256 = "1985zhy8lwnyg5hc436gcma0z9azm1qzsl3rj2vqq080s5czm4d2";
-    };
-    installPhase = ''
-      mkdir -p $out/myetherwallet
-      cp -R dist/* $out/myetherwallet
-    '';
-  };
-
-  dafny = super.dafny.overrideAttrs (_: rec {
-    name = "Dafny-${version}";
-    version = "2.1.0";
-
-    src = self.fetchurl {
-      url = "https://github.com/Microsoft/dafny/archive/v${version}.tar.gz";
-      sha256 = "1iyhy0zpi6wvqif7826anzgdipgsy5bk775ds9qqwfw27j7x6fy5";
-    };
-
-    postPatch = ''
-      sed -i \
-        -e 's/ Visible="False"//' \
-        -e "s/Exists(\$(CodeContractsInstallDir))/Exists('\$(CodeContractsInstallDir)')/" \
-        Source/*/*.csproj
-    '';
-  });
-
 }

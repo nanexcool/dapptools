@@ -31,24 +31,21 @@ let
 
   # These packages should always work and be available in the binary cache.
   stable = dist: with dist.pkgs; {
-    inherit dai;
-    inherit dapp-which;
     inherit dapp;
+    inherit dapp-tests;
     inherit ethsign;
-    inherit evmdis;
     inherit go-ethereum-unlimited;
     inherit go-ethereum;
     inherit hevm;
     inherit qrtx-term;
     inherit qrtx;
     inherit seth;
-    inherit setzer;
     inherit token;
 
     hevm-compliance = hevmCompliance dist;
   # the union is necessary because nix-build does not evaluate sets
-  # recursively, and `solc-versions` is a set
-  } // dist.pkgs.solc-versions ;
+  # recursively, and `solc-versions` and `hevm-tests` are sets.
+  } // dist.pkgs.solc-versions // dist.pkgs.hevm-tests ;
 
 in {
   dapphub.linux.stable = stable linux;

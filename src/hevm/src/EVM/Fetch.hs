@@ -5,14 +5,18 @@ module EVM.Fetch where
 
 import Prelude hiding (Word)
 
-import EVM.Types    (Addr, W256, showAddrWith0x, hexText)
+import EVM.Types    (Addr, W256, hexText)
 import EVM.Concrete (Word, w256)
 import EVM          (EVM, Contract, initialContract, nonce, balance, external)
 
 import qualified EVM
 
 import Control.Lens hiding ((.=))
+import Control.Monad.Reader
 import Control.Monad.Trans.Maybe
+import Data.SBV.Trans.Control
+import qualified Data.SBV.Internals as SBV
+import Data.SBV.Trans hiding (Word)
 import Data.Aeson
 import Data.Aeson.Lens
 import Data.ByteString (ByteString)
@@ -49,7 +53,7 @@ class ToRPC a where
   toRPC :: a -> String
 
 instance ToRPC Addr where
-  toRPC = showAddrWith0x
+  toRPC = show
 
 instance ToRPC W256 where
   toRPC = show
@@ -136,6 +140,7 @@ http n url q =
       fetchSlotFrom n url addr (fromIntegral slot) >>= \case
         Just x  -> return (continue x)
         Nothing -> error ("oracle error: " ++ show q)
+    EVM.PleaseAskSMT _ _ _ -> error "smt calls not available for this oracle"
 
 zero :: Monad m => EVM.Query -> m (EVM ())
 zero q =
@@ -144,5 +149,56 @@ zero q =
       return (continue (initialContract (EVM.RuntimeCode mempty)))
     EVM.PleaseFetchSlot _ _ continue ->
       return (continue 0)
+    EVM.PleaseAskSMT _ _ continue ->
+      return $ continue EVM.Unknown
+
+
 
 type Fetcher = EVM.Query -> IO (EVM ())
+
+-- smtsolving + (http or zero)
+oracle :: SBV.State -> Maybe (BlockNumber, Text) -> Fetcher
+oracle state info q = do
+  case q of
+    EVM.PleaseAskSMT jumpcondition pathconditions continue -> do
+      flip runReaderT state $ SBV.runQueryT $ do
+         let pathconds = sAnd pathconditions
+         noJump <- checksat $ pathconds .&& jumpcondition ./= 0
+         case noJump of
+            -- Unsat means condition
+            -- cannot be nonzero
+            -- We assume it to be zero in this case.
+            -- Theoretically, it is possible that our pathconditions
+            -- are inconsistent, either due to:
+            -- a) a false assumption
+            -- b) a previous timeout
+            -- We allow ourselves to ignore these cases with the motivation that
+            -- a) should be checked elsewhere and,
+            -- if b) occurs, we are in a unreachable path, and its better
+            -- to not keep on branching anyway.
+            Unsat -> return $ continue (EVM.Known 0)
+            -- Sat means its possible for condition
+            -- to be nonzero.
+            Sat -> do jump <- checksat $ pathconds .&& jumpcondition .== 0
+                      -- can it also be zero?
+                      case jump of
+                        -- No. It must be nonzero
+                        Unsat -> return $ continue (EVM.Known 1)
+                        -- Yes. Both branches possible
+                        Sat -> return $ continue EVM.Unknown
+                        -- Explore both branches in case of timeout
+                        Unk -> return $ continue EVM.Unknown
+
+            -- If the query times out, we simply explore both paths
+            Unk -> return $ continue EVM.Unknown
+
+    _ -> case info of
+      Nothing -> zero q
+      Just (n, url) -> http n url q
+
+checksat :: SBool -> Query CheckSatResult
+checksat b = do resetAssertions
+                constrain b
+                m <- checkSat
+                resetAssertions
+                return m

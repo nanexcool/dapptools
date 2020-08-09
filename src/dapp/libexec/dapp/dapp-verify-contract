@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-set -ex
+set -e
 
 [[ $ETHERSCAN_API_KEY ]] || {
   cat >&2 <<.
@@ -31,9 +31,12 @@ esac
 path=${1?contractname}
 name=${path#*:}
 address=${2?contractaddress}
-constructorArguments=$(seth calldata "$4" "${@:5}")
-constructorArguments=${constructorArguments#0x}
-constructorArguments=${constructorArguments:8}
+
+if [[ $4 ]]; then
+    constructorArguments=$(seth calldata "$4" "${@:5}")
+    constructorArguments=${constructorArguments#0x}
+    constructorArguments=${constructorArguments:8}
+fi
 
 meta=$(<"$DAPP_JSON" jshon -e contracts -e "$path" -e metadata -u)
 version=$(jshon <<<"$meta" -e compiler -e version -u)
@@ -46,7 +49,7 @@ version="v${version}"
 
 # Get the list of supported solc versions and compare
 # Etherscan uses the js solc, which is not guaranteed to match the C distribution signature
-set +x
+
 version_list=$(curl -fsS "https://raw.githubusercontent.com/ethereum/solc-bin/gh-pages/bin/list.txt")
 # There have been a couple of instances where the solc js release used by
 #   Etherscan does not match the tag of the C distributions.
@@ -60,7 +63,7 @@ if [[ $version_list != *"$version"* ]]; then
     echo "Attempting ${version}"
   fi
 fi
-set -x
+
 
 if [[ "$optimized" = "true" ]]; then
   optimized=1
@@ -94,6 +97,7 @@ while [ $count -lt 5 ]; do
   --data-urlencode "compilerversion=$version" \
   --data-urlencode "sourceCode@"<(echo "$source") \
   --data-urlencode "constructorArguements=$constructorArguments" -X POST)
+  # NOTE: the Arguements typo is in etherscan's API
 
   status=$(jshon <<<"$response" -e status -u)
   guid=$(jshon <<<"$response" -e result -u)

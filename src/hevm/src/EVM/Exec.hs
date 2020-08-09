@@ -2,6 +2,7 @@ module EVM.Exec where
 
 import EVM
 import EVM.Concrete (createAddress)
+import EVM.Symbolic (litAddr)
 import EVM.Types
 
 import qualified EVM.FeeSchedule as FeeSchedule
@@ -21,10 +22,10 @@ vmForEthrunCreation :: ByteString -> VM
 vmForEthrunCreation creationCode =
   (makeVm $ VMOpts
     { vmoptContract = initialContract (InitCode creationCode)
-    , vmoptCalldata = ""
+    , vmoptCalldata = (mempty, 0)
     , vmoptValue = 0
     , vmoptAddress = createAddress ethrunAddress 1
-    , vmoptCaller = ethrunAddress
+    , vmoptCaller = litAddr ethrunAddress
     , vmoptOrigin = ethrunAddress
     , vmoptCoinbase = 0
     , vmoptNumber = 0
@@ -36,6 +37,7 @@ vmForEthrunCreation creationCode =
     , vmoptGaslimit = 0xffffffffffffffff
     , vmoptMaxCodeSize = 0xffffffff
     , vmoptSchedule = FeeSchedule.istanbul
+    , vmoptChainId = 1
     , vmoptCreate = False
     }) & set (env . contracts . at ethrunAddress)
              (Just (initialContract (RuntimeCode mempty)))
@@ -45,6 +47,12 @@ exec =
   use EVM.result >>= \case
     Nothing -> State.state (runState exec1) >> exec
     Just x  -> return x
+
+run :: MonadState VM m => m VM
+run =
+  use EVM.result >>= \case
+    Nothing -> State.state (runState exec1) >> run
+    Just _  -> State.get
 
 execWhile :: MonadState VM m => (VM -> Bool) -> m Int
 execWhile p = go 0

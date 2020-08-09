@@ -9,24 +9,28 @@ let
 
 in self-hs: super-hs:
   let
-    dontCheck = x:
+    dontCheck = x: y:
       pkgs.haskell.lib.dontCheck
-        (self-hs.callPackage x {});
-    hevmBinPath = lib.makeBinPath (with pkgs; [bash coreutils git]);
-    sbv_8_4_prepatch = self-hs.callCabal2nix "sbv" (builtins.fetchGit {
+        (self-hs.callCabal2nix x y {});
+
+    sbv_prepatch = self-hs.callCabal2nix "sbv" (builtins.fetchGit {
         url = "https://github.com/LeventErkok/sbv/";
-        rev = "b3facdfc959e0779fb8944743c0ec81e0d214ee3";
-    }) {inherit (pkgs) z3;};
+        rev = "99454d9a1a433554db4e631c89adddac651e4e07";
+    })    {inherit (pkgs) z3;};
 
   in {
-    restless-git = dontCheck (import ./src/restless-git);
+    restless-git = dontCheck "restless-git" (./src/restless-git);
     wreq = pkgs.haskell.lib.doJailbreak super-hs.wreq;
 
     # we use a pretty bleeding edge sbv version
-    sbv_8_4 = sbv_8_4_prepatch.overrideAttrs (attrs: {
+    sbv = sbv_prepatch.overrideAttrs (attrs: {
       postPatch = ''
       sed -i -e 's|"z3"|"${pkgs.z3}/bin/z3"|' Data/SBV/Provers/Z3.hs
       sed -i -e 's|"cvc4"|"${pkgs.cvc4}/bin/cvc4"|' Data/SBV/Provers/CVC4.hs'';
+      configureFlags = attrs.configureFlags ++ [
+        "--ghc-option=-O2"
+      ];
+
     });
 
 
@@ -43,7 +47,7 @@ in self-hs: super-hs:
     });
 
     hevm = pkgs.haskell.lib.dontHaddock ((
-      self-hs.callPackage (import ./src/hevm) {
+      self-hs.callCabal2nix "hevm" (./src/hevm) {
         # Haskell libs with the same names as C libs...
         # Depend on the C libs, not the Haskell libs.
         # These are system deps, not Cabal deps.
@@ -53,12 +57,15 @@ in self-hs: super-hs:
       }
     ).overrideAttrs (attrs: {
       postInstall = ''
-        wrapProgram $out/bin/hevm --suffix PATH \
-          : "${lib.makeBinPath (with pkgs; [bash coreutils git])}"
+        wrapProgram $out/bin/hevm --prefix PATH \
+          : "${lib.makeBinPath (with pkgs; [bash coreutils git solc])}"
       '';
 
       enableSeparateDataOutput = true;
       buildInputs = attrs.buildInputs ++ [pkgs.solc];
       nativeBuildInputs = attrs.nativeBuildInputs ++ [pkgs.makeWrapper];
+      configureFlags = attrs.configureFlags ++ [
+          "--ghc-option=-O2"
+          ];
     }));
   }

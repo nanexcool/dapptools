@@ -26,6 +26,10 @@
 ### Options for seth-call(1):
 ###
 ###    -B, --block=<number>       block number (default: `latest')
+###    --hevm                     execute with hevm
+###    --debug                    execute with hevm interactive mode
+###    --trace                    dump a trace to stderr
+###    --code                     overwrite the code of the called contract (hevm only)
 ###
 ### Options for seth-send(1):
 ###
@@ -33,6 +37,18 @@
 ###    --guess                    guess the return value of the call
 ###    --status                   exit failure on failed tx (Byzantium)
 ###    --resend                   force current nonce to overwrite tx
+###
+### Options for seth-debug(1):
+###
+###    --no-src                   don't try to fetch contract source
+###
+### Options for seth-run-tx(1):
+###
+###    --debug                    run in hevm interactive mode
+###    --trace                    dump a trace to stderr
+###    --source=<file>            path to combined.json source
+###    --state=<dir>              directory to store hevm state in
+###
 ###
 ### Other options:
 ###
@@ -59,8 +75,15 @@ N,nonce=number       nonce value to use for the transaction
 V,value=number       amount (in wei) of ETH to send
 S,password=file      password for non-interactive signing
 
+  Options for seth-block(1):
+full                 get block with full transaction information
+
   Options for seth-call(1):
 B,block=number       block number (default: \`latest')
+hevm                 execute with hevm
+debug                execute with hevm interactive mode
+trace                dump a trace to stderr
+code                 bytecode to replace the called contract with
 
   Options for seth-send(1):
 create               use the calldata to create a new object
@@ -68,10 +91,24 @@ guess                guess the return value of the call
 status               exit failure on failed tx (Byzantium)
 resend               force current nonce to overwrite tx
 
+  Options for seth-run-tx(1):
+state=directory      git repo where state is kept
+timestamp=number     block timestamp for the tx
+debug                run in hevm's interactive debugger
+trace                dump a trace to stderr
+source=file          combined-json source information file
+
+  Options for seth-debug(1):
+no-src               don't fetch contract source
+
+  Options for seth-bundle-source(1):
+D,dir=directory      directory to store output
+
   Other options:
 async                do not wait for transaction receipt
 follow               go into a loop watching for new logs
 j,json               print output as JSON (if applicable)
+v,verbose            print additional debugging information
 "
 
 set -e
@@ -116,6 +153,22 @@ while [[ $1 ]]; do
     -N|--nonce)      shift; export ETH_NONCE=$1;;
     -V|--value)      shift; export ETH_VALUE=$1;;
     -S|--password)   shift; export ETH_PASSWORD=$1;;
+
+       --state)      shift; export HEVM_STATE=$1;;
+       --timestamp)  shift; export HEVM_TIMESTAMP=$1;;
+       --debug)             export HEVM_DEBUG=yes;;
+       --trace)             export HEVM_TRACE=yes;;
+       --hevm)              export HEVM_EXEC=yes;;
+       --source)     shift; export DAPP_JSON=$1;;
+       --code)       shift; export HEVM_CODE=$1;;
+
+    -D|--dir)        shift; export SETH_DIR=$1;;
+
+       --no-src)            export SETH_NOSRC=yes;;
+
+       --full)              export SETH_FULL_BLOCK=yes;;
+
+    -v|--verbose)           export SETH_VERBOSE=yes;;
 
        --create)            export SETH_CREATE=yes;;
        --guess)             export SETH_GUESS=yes;;
@@ -169,6 +222,6 @@ if [[ ${#keystores[@]} -gt 0 ]]; then
 fi
 
 [[ -n $ETH_KEYSTORE ]] && export ETH_KEYSTORE
-export ETH_RPC_URL=${ETH_RPC_URL:-$eth_rpc_url}
+export ETH_RPC_URL=${ETH_RPC_URL:-${eth_rpc_url:-${ETH_RPC_HOST:-http://127.0.0.1}:${ETH_RPC_PORT:-8545}}}
 
 "${0##*/}-${1-help}" "${@:2}"

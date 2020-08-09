@@ -47,7 +47,7 @@ module EVM.ABI
   , parseTypeName
   , makeAbiValue
   , parseAbiValue
-  , sig
+  , selector
   ) where
 
 import EVM.Keccak (abiKeccak)
@@ -98,7 +98,7 @@ data AbiValue
 instance Show AbiValue where
   show (AbiUInt _ n)         = show n
   show (AbiInt  _ n)         = show n
-  show (AbiAddress n)        = showAddrWith0x n
+  show (AbiAddress n)        = show n
   show (AbiBool b)           = if b then "true" else "false"
   show (AbiBytes      _ b)   = show (ByteStringS b)
   show (AbiBytesDynamic b)   = show (ByteStringS b)
@@ -121,7 +121,10 @@ data AbiType
   | AbiArrayDynamicType AbiType
   | AbiArrayType        Int AbiType
   | AbiTupleType        (Vector AbiType)
-  deriving (Show, Read, Eq, Ord, Generic)
+  deriving (Read, Eq, Ord, Generic)
+
+instance Show AbiType where
+  show = Text.unpack . abiTypeSolidity
 
 data AbiKind = Dynamic | Static
   deriving (Show, Read, Eq, Ord, Generic)
@@ -329,8 +332,8 @@ encodeAbiValue = BSLazy.toStrict . runPut . putAbi
 decodeAbiValue :: AbiType -> BSLazy.ByteString -> AbiValue
 decodeAbiValue = runGet . getAbi
 
-sig :: Text -> BS.ByteString
-sig s = BSLazy.toStrict . runPut $ putWord32be (abiKeccak (encodeUtf8 s))
+selector :: Text -> BS.ByteString
+selector s = BSLazy.toStrict . runPut $ putWord32be (abiKeccak (encodeUtf8 s))
 
 abiMethod :: Text -> AbiValue -> BS.ByteString
 abiMethod s args = BSLazy.toStrict . runPut $ do

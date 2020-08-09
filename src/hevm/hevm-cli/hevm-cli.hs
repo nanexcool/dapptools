@@ -11,6 +11,8 @@
 {-# Language TypeOperators #-}
 
 import qualified EVM
+import EVM.Concrete (createAddress, w256)
+import EVM.Symbolic (forceLitBytes, litBytes, litAddr, w256lit, sw256, SymWord(..), Buffer(..), len)
 import qualified EVM.FeeSchedule as FeeSchedule
 import qualified EVM.Fetch
 import qualified EVM.Flatten
@@ -18,16 +20,12 @@ import qualified EVM.Stepper
 import qualified EVM.TTY
 import qualified EVM.Emacs
 
-import Text.ParserCombinators.ReadP
-
 #if MIN_VERSION_aeson(1, 0, 0)
 import qualified EVM.VMTest as VMTest
 #endif
 
-import EVM (ExecMode(..))
-import EVM.Concrete (createAddress, w256)
+import EVM.SymExec
 import EVM.Debug
-import EVM.Exec
 import EVM.ABI
 import EVM.Solidity
 import EVM.Types hiding (word)
@@ -35,31 +33,32 @@ import EVM.UnitTest (UnitTestOptions, coverageReport, coverageForUnitTestContrac
 import EVM.UnitTest (runUnitTestContract)
 import EVM.UnitTest (getParametersFromEnvironmentVariables, testNumber)
 import EVM.Dapp (findUnitTests, dappInfo)
+import EVM.Format (showTraceTree)
 import EVM.RLP (rlpdecode)
 import qualified EVM.Patricia as Patricia
 import Data.Map (Map)
-import Numeric (readHex, showHex)
 
 import qualified EVM.Facts     as Facts
 import qualified EVM.Facts.Git as Git
 import qualified EVM.UnitTest
 
 import Control.Concurrent.Async   (async, waitCatch)
-import Control.Exception          (evaluate)
-import qualified Control.Monad.Operational as Operational
-import qualified Control.Monad.State.Class as State
-import Control.Lens
-import Control.Monad              (void, when, forM_)
-import Control.Monad.State.Strict (execState, runState, StateT, liftIO, execStateT)
+import Control.Lens hiding (pre)
+import Control.Monad              (void, when, forM_, unless)
+import Control.Monad.State.Strict (execStateT)
 import Data.ByteString            (ByteString)
 import Data.List                  (intercalate, isSuffixOf)
-import Data.Text                  (Text, unpack, pack, splitOn)
+import Data.Text                  (Text, unpack, pack)
 import Data.Text.Encoding         (encodeUtf8)
+import Data.Text.IO               (hPutStr)
 import Data.Maybe                 (fromMaybe, fromJust)
 import Data.Version               (showVersion)
+import Data.SBV hiding (Word, solver, verbose, name)
+import Data.SBV.Control hiding (Version, timeout, create)
+import System.IO                  (hFlush, hPrint, stdout, stderr)
 import System.Directory           (withCurrentDirectory, listDirectory)
-import System.Exit                (die, exitFailure)
-import System.IO                  (hFlush, stdout)
+import System.Exit                (die, exitFailure, exitWith, ExitCode(..))
+import System.Environment         (setEnv)
 import System.Process             (callProcess)
 import qualified Data.Aeson        as JSON
 import qualified Data.Aeson.Types  as JSON
@@ -83,7 +82,50 @@ import Options.Generic as Options
 -- This record defines the program's command-line options
 -- automatically via the `optparse-generic` package.
 data Command w
-  = Exec -- Execute a given program with specified env & calldata
+  = Symbolic -- Symbolically explore an abstract program, or specialized with specified env & calldata
+  -- vm opts
+      { code          :: w ::: Maybe ByteString <?> "Program bytecode"
+      , calldata      :: w ::: Maybe ByteString <?> "Tx: calldata"
+      , address       :: w ::: Maybe Addr       <?> "Tx: address"
+      , caller        :: w ::: Maybe Addr       <?> "Tx: caller"
+      , origin        :: w ::: Maybe Addr       <?> "Tx: origin"
+      , coinbase      :: w ::: Maybe Addr       <?> "Block: coinbase"
+      , value         :: w ::: Maybe W256       <?> "Tx: Eth amount"
+      , nonce         :: w ::: Maybe W256       <?> "Nonce of origin"
+      , gas           :: w ::: Maybe W256       <?> "Tx: gas amount"
+      , number        :: w ::: Maybe W256       <?> "Block: number"
+      , timestamp     :: w ::: Maybe W256       <?> "Block: timestamp"
+      , gaslimit      :: w ::: Maybe W256       <?> "Tx: gas limit"
+      , gasprice      :: w ::: Maybe W256       <?> "Tx: gas price"
+      , create        :: w ::: Bool             <?> "Tx: creation"
+      , maxcodesize   :: w ::: Maybe W256       <?> "Block: max code size"
+      , difficulty    :: w ::: Maybe W256       <?> "Block: difficulty"
+      , chainid       :: w ::: Maybe W256       <?> "Env: chainId"
+  -- remote state opts
+      , rpc         :: w ::: Maybe URL        <?> "Fetch state from a remote node"
+      , block       :: w ::: Maybe W256       <?> "Block state is be fetched from"
+
+  -- symbolic execution opts
+      , jsonFile      :: w ::: Maybe String       <?> "Filename or path to dapp build output (default: out/*.solc.json)"
+      , dappRoot      :: w ::: Maybe String       <?> "Path to dapp project root directory (default: . )"
+      , storageModel  :: w ::: Maybe StorageModel <?> "Select storage model: ConcreteS, SymbolicS (default) or InitialS"
+      , sig           :: w ::: Maybe Text         <?> "Signature of types to decode / encode"
+      , arg           :: w ::: [String]           <?> "Values to encode"
+      , debug         :: w ::: Bool               <?> "Run interactively"
+      , getModels     :: w ::: Bool               <?> "Print example testcase for each execution path"
+      , smttimeout    :: w ::: Maybe Integer      <?> "Timeout given to SMT solver in milliseconds (default: 20000)"
+      , maxIterations :: w ::: Maybe Integer      <?> "Number of times we may revisit a particular branching point"
+      , solver        :: w ::: Maybe Text         <?> "Used SMT solver: z3 (default) or cvc4"
+      }
+  | Equivalence -- prove equivalence between two programs
+      { codeA         :: w ::: ByteString    <?> "Bytecode of the first program"
+      , codeB         :: w ::: ByteString    <?> "Bytecode of the second program"
+      , sig           :: w ::: Maybe Text    <?> "Signature of types to decode / encode"
+      , smttimeout    :: w ::: Maybe Integer <?> "Timeout given to SMT solver in milliseconds (default: 20000)"
+      , maxIterations :: w ::: Maybe Integer <?> "Number of times we may revisit a particular branching point"
+      , solver        :: w ::: Maybe Text    <?> "Used SMT solver: z3 (default) or cvc4"
+      }
+  | Exec -- Execute a given program with specified env & calldata
       { code        :: w ::: Maybe ByteString <?> "Program bytecode"
       , calldata    :: w ::: Maybe ByteString <?> "Tx: calldata"
       , address     :: w ::: Maybe Addr       <?> "Tx: address"
@@ -100,10 +142,14 @@ data Command w
       , create      :: w ::: Bool             <?> "Tx: creation"
       , maxcodesize :: w ::: Maybe W256       <?> "Block: max code size"
       , difficulty  :: w ::: Maybe W256       <?> "Block: difficulty"
+      , chainid     :: w ::: Maybe W256       <?> "Env: chainId"
       , debug       :: w ::: Bool             <?> "Run interactively"
+      , trace       :: w ::: Bool             <?> "Dump trace"
       , state       :: w ::: Maybe String     <?> "Path to state repository"
       , rpc         :: w ::: Maybe URL        <?> "Fetch state from a remote node"
       , block       :: w ::: Maybe W256       <?> "Block state is be fetched from"
+      , jsonFile    :: w ::: Maybe String     <?> "Filename or path to dapp build output (default: out/*.solc.json)"
+      , dappRoot    :: w ::: Maybe String     <?> "Path to dapp project root directory (default: . )"
       }
   | DappTest -- Run DSTest unit tests
       { jsonFile    :: w ::: Maybe String             <?> "Filename or path to dapp build output (default: out/*.solc.json)"
@@ -131,14 +177,7 @@ data Command w
       , diff    :: w ::: Bool      <?> "Print expected vs. actual state on failure"
       , timeout :: w ::: Maybe Int <?> "Execution timeout (default: 10 sec.)"
       }
-  | VmTest -- Run an Ethereum VMTest
-      { file    :: w ::: String    <?> "Path to .json test file"
-      , test    :: w ::: [String]  <?> "Test case filter - only run specified test method(s)"
-      , debug   :: w ::: Bool      <?> "Run interactively"
-      , diff    :: w ::: Bool      <?> "Print expected vs. actual state on failure"
-      , timeout :: w ::: Maybe Int <?> "Execution timeout (default: 10 sec.)"
-      }
-  | Compliance -- Run Ethereum Blockhain or VMTest compliance report
+  | Compliance -- Run Ethereum Blockhain compliance report
       { tests   :: w ::: String       <?> "Path to Ethereum Tests directory"
       , group   :: w ::: Maybe String <?> "Report group to run: VM or Blockchain (default: Blockchain)"
       , match   :: w ::: Maybe String <?> "Test case filter - only run methods matching regex"
@@ -157,8 +196,8 @@ data Command w
   { decode :: w ::: ByteString <?> "RLP encoded hexstring"
   }
   | Abiencode
-  { abi  :: w ::: String      <?> "Signature of types to decode / encode"
-  , arg  :: w ::: [String]    <?> "Values to encode"
+  { abi  :: w ::: Maybe String <?> "Signature of types to decode / encode"
+  , arg  :: w ::: [String]     <?> "Values to encode"
   }
   | MerkleTest -- Insert a set of key values and check against the given root
   { file :: w ::: String <?> "Path to .json test file"
@@ -197,21 +236,21 @@ unitTestOptions cmd = do
 
   let
     testn = testNumber params
-    block = if 0 == testn
+    block' = if 0 == testn
        then EVM.Fetch.Latest
        else EVM.Fetch.BlockNumber testn
 
   pure EVM.UnitTest.UnitTestOptions
     { EVM.UnitTest.oracle =
         case rpc cmd of
-         Just url -> EVM.Fetch.http block url
+         Just url -> EVM.Fetch.http block' url
          Nothing  -> EVM.Fetch.zero
     , EVM.UnitTest.verbose = verbose cmd
     , EVM.UnitTest.match   = pack $ fromMaybe "^test" (match cmd)
     , EVM.UnitTest.fuzzRuns = fromMaybe 100 (fuzzRuns cmd)
     , EVM.UnitTest.replay   = do
-        arg <- replay cmd
-        return (fst arg, LazyByteString.fromStrict (hexByteString "--replay" $ strip0x $ snd arg))
+        arg' <- replay cmd
+        return (fst arg', LazyByteString.fromStrict (hexByteString "--replay" $ strip0x $ snd arg'))
     , EVM.UnitTest.vmModifier = vmModifier
     , EVM.UnitTest.testParams = params
     }
@@ -223,14 +262,14 @@ main = do
     root = fromMaybe "." (dappRoot cmd)
   case cmd of
     Version {} -> putStrLn (showVersion Paths.version)
+    Symbolic {} -> assert cmd
+    Equivalence {} -> equivalence cmd
     Exec {} ->
       launchExec cmd
     Abiencode {} ->
       print . ByteStringS $ abiencode (abi cmd) (arg cmd)
-    VmTest {} ->
-      launchTest ExecuteAsVMTest cmd
     BcTest {} ->
-      launchTest ExecuteAsBlockchainTest cmd
+      launchTest cmd
     DappTest {} ->
       withCurrentDirectory root $ do
         testFile <- findJsonFile (jsonFile cmd)
@@ -328,6 +367,131 @@ regexMatches regexSource =
   in
     Regex.matchTest regex . Seq.fromList . unpack
 
+equivalence :: Command Options.Unwrapped -> IO ()
+equivalence cmd =
+  do let bytecodeA = hexByteString "--code" . strip0x $ codeA cmd
+         bytecodeB = hexByteString "--code" . strip0x $ codeB cmd
+     maybeSignature <- case sig cmd of
+       Nothing -> return Nothing
+       Just sig' -> do method' <- functionAbi sig'
+                       return $ Just (view methodSignature method', snd <$> view methodInputs method')
+
+     void . runSMTWithTimeOut (solver cmd) (smttimeout cmd) . query $
+       equivalenceCheck bytecodeA bytecodeB (maxIterations cmd) maybeSignature >>= \case
+         Right vm -> do io $ putStrLn "Not equal!"
+                        io $ putStrLn "Counterexample:"
+                        showCounterexample vm maybeSignature
+                        io $ exitFailure
+         Left (postAs, postBs) -> io $ do
+           putStrLn $ "Explored: " <> show (length postAs)
+                       <> " execution paths of A and: "
+                       <> show (length postBs) <> " paths of B."
+           putStrLn $ "No discrepancies found."
+
+
+-- cvc4 sets timeout via a commandline option instead of smtlib `(set-option)`
+runSMTWithTimeOut :: Maybe Text -> Maybe Integer -> Symbolic a -> IO a
+runSMTWithTimeOut solver maybeTimeout sym
+  | solver == Just "cvc4" = do
+      setEnv "SBV_CVC4_OPTIONS" ("--lang=smt --incremental --interactive --no-interactive-prompt --model-witness-value --tlimit-per=" <> show timeout)
+      a <- runSMTWith cvc4 sym
+      setEnv "SBV_CVC4_OPTIONS" ""
+      return a
+  | solver == Just "z3" = runwithz3
+  | solver == Nothing = runwithz3
+  | otherwise = error "Unknown solver. Currently supported solvers; z3, cvc4"
+ where timeout = fromMaybe 20000 maybeTimeout
+       runwithz3 = runSMTWith z3 $ (setTimeOut timeout) >> sym
+
+
+checkForVMErrors :: [EVM.VM] -> [String]
+checkForVMErrors [] = []
+checkForVMErrors (vm:vms) =
+  case view EVM.result vm of
+    Just (EVM.VMFailure EVM.UnexpectedSymbolicArg) ->
+      ("Unexpected symbolic argument at opcode: "
+      <> maybe "??" show (EVM.vmOp vm)
+      <> ". Not supported (yet!)"
+      ) : checkForVMErrors vms
+    _ ->
+      checkForVMErrors vms
+
+-- Although it is tempting to fully abstract calldata and give any hints about
+-- the nature of the signature doing so results in significant time spent in
+-- consulting z3 about rather trivial matters. But with cvc4 it is quite
+-- pleasant!
+
+-- If function signatures are known, they should always be given for best results.
+assert :: Command Options.Unwrapped -> IO ()
+assert cmd = do
+  let root = fromMaybe "." (dappRoot cmd)
+      srcinfo = ((,) root) <$> (jsonFile cmd)
+      block'  = maybe EVM.Fetch.Latest EVM.Fetch.BlockNumber (block cmd)
+      rpcinfo = (,) block' <$> rpc cmd
+  maybesig <- case sig cmd of
+    Nothing ->
+      return Nothing
+    Just sig' -> do
+      method' <- functionAbi sig'
+      let typ = snd <$> view methodInputs method'
+          name = view methodSignature method'
+      return $ Just (name,typ)
+  if debug cmd then
+    runSMTWithTimeOut (solver cmd) (smttimeout cmd) $ query $ do
+      preState <- symvmFromCommand cmd
+      smtState <- queryState
+      io $ void $ EVM.TTY.runFromVM srcinfo (EVM.Fetch.oracle smtState rpcinfo) preState
+
+  else
+    runSMTWithTimeOut (solver cmd) (smttimeout cmd) $ query $ do
+      preState <- symvmFromCommand cmd
+      verify preState (maxIterations cmd) rpcinfo (Just checkAssertions) >>= \case
+        Right _ -> do
+          io $ putStrLn "Assertion violation found."
+          showCounterexample preState maybesig
+          io $ exitWith (ExitFailure 1)
+        Left (pre, posts) -> do
+          io $ putStrLn $ "Explored: " <> show (length posts)
+                       <> " branches without assertion violations"
+          let vmErrs = checkForVMErrors posts
+          unless (null vmErrs) $ io $ do
+            putStrLn $
+              "However, "
+              <> show (length vmErrs)
+              <> " branch(es) errored while exploring:"
+            print vmErrs
+          -- When `--get-model` is passed, we print example vm info for each path
+          when (getModels cmd) $
+            forM_ (zip [1..] posts) $ \(i, postVM) -> do
+              resetAssertions
+              constrain (sAnd (view EVM.pathConditions postVM))
+              io $ putStrLn $
+                "-- Branch (" <> show i <> "/" <> show (length posts) <> ") --"
+              checkSat >>= \case
+                Unk -> io $ putStrLn "Timed out"
+                Unsat -> io $ putStrLn "Inconsistent path conditions: dead path"
+                Sat -> do
+                  showCounterexample pre maybesig
+                  case view EVM.result postVM of
+                    Nothing ->
+                      error "internal error; no EVM result"
+                    Just (EVM.VMFailure (EVM.Revert "")) -> io . putStrLn $
+                      "Reverted"
+                    Just (EVM.VMFailure (EVM.Revert msg)) -> io . putStrLn $
+                      "Reverted: " <> show (ByteStringS msg)
+                    Just (EVM.VMFailure err) -> io . putStrLn $
+                      "Failed: " <> show err
+                    Just (EVM.VMSuccess (ConcreteBuffer msg)) ->
+                      if ByteString.null msg
+                      then io $ putStrLn
+                        "Stopped"
+                      else io $ putStrLn $
+                        "Returned: " <> show (ByteStringS msg)
+                    Just (EVM.VMSuccess (SymbolicBuffer msg)) -> do
+                      out <- mapM (getValue.fromSized) msg
+                      io . putStrLn $
+                        "Returned: " <> show (ByteStringS (ByteString.pack out))
+
 dappCoverage :: UnitTestOptions -> Mode -> String -> IO ()
 dappCoverage opts _ solcFile =
   readSolc solcFile >>=
@@ -360,6 +524,17 @@ dappCoverage opts _ solcFile =
 
 launchExec :: Command Options.Unwrapped -> IO ()
 launchExec cmd = do
+  let root = fromMaybe "." (dappRoot cmd)
+      srcinfo = ((,) root) <$> (jsonFile cmd)
+  dapp <- case (jsonFile cmd) of
+    Nothing ->
+      pure $ dappInfo "" mempty (SourceCache mempty mempty mempty mempty)
+    Just json -> readSolc json >>= \case
+      Nothing ->
+        pure $ dappInfo "" mempty (SourceCache mempty mempty mempty mempty)
+      Just (contractMap, sourceCache) ->
+        pure $ dappInfo root contractMap sourceCache
+
   vm <- vmFromCommand cmd
   vm1 <- case state cmd of
     Nothing -> pure vm
@@ -371,21 +546,27 @@ launchExec cmd = do
 
   case optsMode cmd of
     Run -> do
-      vm' <- execStateT (interpret fetcher . void $ EVM.Stepper.execFully) vm1
+      vm' <- execStateT (interpret fetcher Nothing . void $ EVM.Stepper.execFully) vm1
+      when (trace cmd) $ hPutStr stderr (showTraceTree dapp vm')
       case view EVM.result vm' of
         Nothing ->
           error "internal error; no EVM result"
-        Just (EVM.VMFailure (EVM.Revert msg)) ->
-          die . show . ByteStringS $ msg
-        Just (EVM.VMFailure err) ->
-          die . show $ err
-        Just (EVM.VMSuccess msg) -> do
-          (print . ByteStringS) msg
+        Just (EVM.VMFailure (EVM.Revert msg)) -> do
+          print $ ByteStringS msg
+          exitWith (ExitFailure 2)
+        Just (EVM.VMFailure err) -> do
+          print err
+          exitWith (ExitFailure 2)
+        Just (EVM.VMSuccess buf) -> do
+          let msg = case buf of
+                SymbolicBuffer msg' -> forceLitBytes msg'
+                ConcreteBuffer msg' -> msg'
+          print $ ByteStringS msg
           case state cmd of
             Nothing -> pure ()
             Just path ->
               Git.saveFacts (Git.RepoAt path) (Facts.vmFacts vm')
-    Debug -> void (EVM.TTY.runFromVM fetcher vm1)
+    Debug -> void $ EVM.TTY.runFromVM srcinfo fetcher vm1
    where fetcher = maybe EVM.Fetch.zero (EVM.Fetch.http block') (rpc cmd)
          block'  = maybe EVM.Fetch.Latest EVM.Fetch.BlockNumber (block cmd)
 
@@ -399,8 +580,8 @@ parseTups (JSON.Array arr) = do
   tupList <- mapM parseJSON (V.toList arr)
   mapM (\[k, v] -> do
                   rhs <- parseJSON v
-                  key <- parseJSON k
-                  return (key, rhs))
+                  lhs <- parseJSON k
+                  return (lhs, rhs))
          tupList
 parseTups invalid = JSON.typeMismatch "Malformed array" invalid
 
@@ -427,12 +608,17 @@ merkleTest cmd = do
     Right testcases -> mapM_ runMerkleTest testcases
 
 runMerkleTest :: Testcase -> IO ()
-runMerkleTest (Testcase entries root) = case Patricia.calcRoot entries' of
-                                          Nothing -> error "Test case failed"
-                                          Just n -> case n == strip0x (hexText root) of
-                                            True -> putStrLn "Test case success"
-                                            False -> error ("Test case failure; expected "
-                                                            <> show root <> " but got " <> show (ByteStringS n))
+runMerkleTest (Testcase entries root) =
+  case Patricia.calcRoot entries' of
+    Nothing ->
+      error "Test case failed"
+    Just n ->
+      case n == strip0x (hexText root) of
+        True ->
+          putStrLn "Test case success"
+        False ->
+          error ("Test case failure; expected " <> show root
+                 <> " but got " <> show (ByteStringS n))
   where entries' = fmap (\(k, v) ->
                            (tohexOrText k,
                             tohexOrText (fromMaybe mempty v)))
@@ -446,35 +632,42 @@ tohexOrText s = case "0x" `Char8.isPrefixOf` encodeUtf8 s of
 
 vmFromCommand :: Command Options.Unwrapped -> IO EVM.VM
 vmFromCommand cmd = do
-  vm <- case (code cmd, rpc cmd) of
-     (Nothing, Nothing) -> error "Missing: --code TEXT or --rpc TEXT"
-     (Just c,  Nothing) -> return $ vm1 (EVM.initialContract (codeType (hexByteString "--code" (strip0x c))))
-     (a     , Just url) -> do maybeContract <- EVM.Fetch.fetchContractFrom block' url address'
-                              case maybeContract of
-                                  Nothing -> error $ "contract not found: " <> show address'
-                                  Just contract' -> case a of
-                                    Nothing -> return (vm1 contract')
-                                    -- if both code and url is given,
-                                    -- fetch the contract then overwrite the code
-                                    Just c -> return $ (vm1 contract') & set (EVM.state . EVM.code) c
+  vm <- case (rpc cmd, address cmd) of
+    (Just url, Just addr') -> do
+      EVM.Fetch.fetchContractFrom block' url addr' >>= \case
+        Nothing -> error $ "contract not found: " <> show address'
+        Just contract' -> case code cmd of
+          Nothing -> return (vm1 contract')
+          -- if both code and url is given,
+          -- fetch the contract and overwrite the code
+          Just c -> return . vm1 $
+            EVM.initialContract  (codeType $ hexByteString "--code" $ strip0x c)
+              & set EVM.storage  (view EVM.storage  contract')
+              & set EVM.balance  (view EVM.balance  contract')
+              & set EVM.nonce    (view EVM.nonce    contract')
+              & set EVM.external (view EVM.external contract')
+
+    _ -> return . vm1 . EVM.initialContract . codeType $ bytes code ""
+
   return $ vm & EVM.env . EVM.contracts . ix address' . EVM.balance +~ (w256 value')
       where
+        decipher = hexByteString "bytes" . strip0x
         block'   = maybe EVM.Fetch.Latest EVM.Fetch.BlockNumber (block cmd)
         value'   = word value 0
         caller'  = addr caller 0
-        origin'  = addr origin caller'
+        origin'  = addr origin 0
+        calldata' = ConcreteBuffer $ bytes calldata ""
         codeType = if create cmd then EVM.InitCode else EVM.RuntimeCode
         address' = if create cmd
               then createAddress origin' (word nonce 0)
               else addr address 0xacab
-    
+
         vm1 c = EVM.makeVm $ EVM.VMOpts
           { EVM.vmoptContract      = c
-          , EVM.vmoptCalldata      = maybe "" ((hexByteString "--calldata") . strip0x)
-                                       (calldata cmd)
-          , EVM.vmoptValue         = value'
+          , EVM.vmoptCalldata      = (calldata', literal . num $ len calldata')
+          , EVM.vmoptValue         = w256lit value'
           , EVM.vmoptAddress       = address'
-          , EVM.vmoptCaller        = caller'
+          , EVM.vmoptCaller        = litAddr caller'
           , EVM.vmoptOrigin        = origin'
           , EVM.vmoptGas           = word gas 0
           , EVM.vmoptGaslimit      = word gas 0
@@ -486,19 +679,110 @@ vmFromCommand cmd = do
           , EVM.vmoptMaxCodeSize   = word maxcodesize 0xffffffff
           , EVM.vmoptDifficulty    = word difficulty 0
           , EVM.vmoptSchedule      = FeeSchedule.istanbul
+          , EVM.vmoptChainId       = word chainid 1
           , EVM.vmoptCreate        = create cmd
           }
         word f def = fromMaybe def (f cmd)
         addr f def = fromMaybe def (f cmd)
+        bytes f def = maybe def decipher (f cmd)
 
-launchTest :: ExecMode -> Command Options.Unwrapped ->  IO ()
-launchTest execmode cmd = do
+symvmFromCommand :: Command Options.Unwrapped -> Query EVM.VM
+symvmFromCommand cmd = do
+  caller' <- maybe (SAddr <$> freshVar_) (return . litAddr) (caller cmd)
+  callvalue' <- maybe (sw256 <$> freshVar_) (return . w256lit) (value cmd)
+  (calldata', cdlen, pathCond) <- case (calldata cmd, sig cmd) of
+    -- fully abstract calldata (up to 1024 bytes)
+    (Nothing, Nothing) -> do
+      cd <- sbytes256
+      len <- freshVar_
+      return (SymbolicBuffer cd, len, len .<= 1024)
+    -- fully concrete calldata
+    (Just c, Nothing) ->
+      let cd = ConcreteBuffer $ decipher c
+      in return (cd, num (len cd), sTrue)
+    -- calldata according to given abi with possible specializations from the `arg` list
+    (Nothing, Just sig') -> do
+      method' <- io $ functionAbi sig'
+      let typs = snd <$> view methodInputs method'
+      (cd, cdlen) <- symCalldata (view methodSignature method') typs (arg cmd)
+      return (SymbolicBuffer cd, cdlen, sTrue)
+
+    _ -> error "incompatible options: calldata and abi"
+
+  store <- case storageModel cmd of
+    -- InitialS and SymbolicS can read and write to symbolic locations
+    -- ConcreteS cannot (instead values can be fetched from rpc!)
+    -- Initial defaults to 0 for uninitialized storage slots,
+    -- whereas the values of SymbolicS are unconstrained.
+    Just InitialS  -> EVM.Symbolic <$> freshArray_ (Just 0)
+    Just ConcreteS -> return (EVM.Concrete mempty)
+    Just SymbolicS -> EVM.Symbolic <$> freshArray_ Nothing
+    Nothing -> EVM.Symbolic <$> freshArray_ (if create cmd then (Just 0) else Nothing)
+
+  vm <- case (rpc cmd, address cmd, code cmd) of
+    (Just url, Just addr', _) ->
+      io (EVM.Fetch.fetchContractFrom block' url addr') >>= \case
+        Nothing ->
+          error $ "contract not found."
+        Just contract' ->
+          return $
+            vm1 cdlen calldata' callvalue' caller' (contract'' & set EVM.storage store)
+          where
+            contract'' = case code cmd of
+              Nothing -> contract'
+              -- if both code and url is given,
+              -- fetch the contract and overwrite the code
+              Just c -> EVM.initialContract (codeType $ decipher c)
+                        & set EVM.storage     (view EVM.storage contract')
+                        & set EVM.origStorage (view EVM.origStorage contract')
+                        & set EVM.balance     (view EVM.balance contract')
+                        & set EVM.nonce       (view EVM.nonce contract')
+                        & set EVM.external    (view EVM.external contract')
+
+    (_, _, Just c)  ->
+      return $
+        vm1 cdlen calldata' callvalue' caller' $
+          (EVM.initialContract . codeType $ decipher c) & set EVM.storage store
+    (_, _, Nothing) ->
+      error $ "must provide at least (rpc + address) or code"
+
+  return $ vm & over EVM.pathConditions (<> [pathCond])
+
+  where
+    decipher = hexByteString "bytes" . strip0x
+    block'   = maybe EVM.Fetch.Latest EVM.Fetch.BlockNumber (block cmd)
+    origin'  = addr origin 0
+    codeType = if create cmd then EVM.InitCode else EVM.RuntimeCode
+    address' = if create cmd
+          then createAddress origin' (word nonce 0)
+          else addr address 0xacab
+    vm1 cdlen calldata' callvalue' caller' c = EVM.makeVm $ EVM.VMOpts
+      { EVM.vmoptContract      = c
+      , EVM.vmoptCalldata      = (calldata', cdlen)
+      , EVM.vmoptValue         = callvalue'
+      , EVM.vmoptAddress       = address'
+      , EVM.vmoptCaller        = caller'
+      , EVM.vmoptOrigin        = origin'
+      , EVM.vmoptGas           = word gas 0xffffffffffffffff
+      , EVM.vmoptGaslimit      = word gas 0xffffffffffffffff
+      , EVM.vmoptCoinbase      = addr coinbase 0
+      , EVM.vmoptNumber        = word number 0
+      , EVM.vmoptTimestamp     = word timestamp 0
+      , EVM.vmoptBlockGaslimit = word gaslimit 0
+      , EVM.vmoptGasprice      = word gasprice 0
+      , EVM.vmoptMaxCodeSize   = word maxcodesize 0xffffffff
+      , EVM.vmoptDifficulty    = word difficulty 0
+      , EVM.vmoptSchedule      = FeeSchedule.istanbul
+      , EVM.vmoptChainId       = word chainid 1
+      , EVM.vmoptCreate        = create cmd
+      }
+    word f def = fromMaybe def (f cmd)
+    addr f def = fromMaybe def (f cmd)
+
+launchTest :: Command Options.Unwrapped ->  IO ()
+launchTest cmd = do
 #if MIN_VERSION_aeson(1, 0, 0)
-  let parser = case execmode of
-        ExecuteAsVMTest -> VMTest.parseSuite
-        ExecuteAsBlockchainTest -> VMTest.parseBCSuite
-        ExecuteNormally -> error "cannot launchTest normally"
-  parsed <- parser <$> LazyByteString.readFile (file cmd)
+  parsed <- VMTest.parseBCSuite <$> LazyByteString.readFile (file cmd)
   case parsed of
      Left "No cases to check." -> putStrLn "no-cases ok"
      Left err -> print err
@@ -508,30 +792,30 @@ launchTest execmode cmd = do
              then id
              else filter (\(x, _) -> elem x (test cmd))
        in
-         mapM_ (runVMTest (diff cmd) execmode (optsMode cmd) (timeout cmd)) $
+         mapM_ (runVMTest (diff cmd) (optsMode cmd) (timeout cmd)) $
            testFilter (Map.toList allTests)
 #else
   putStrLn "Not supported"
 #endif
 
 #if MIN_VERSION_aeson(1, 0, 0)
-runVMTest :: Bool -> ExecMode -> Mode -> Maybe Int -> (String, VMTest.Case) -> IO Bool
-runVMTest diffmode execmode mode timelimit (name, x) = do
-  let vm0 = VMTest.vmForCase execmode x
+runVMTest :: Bool -> Mode -> Maybe Int -> (String, VMTest.Case) -> IO Bool
+runVMTest diffmode mode timelimit (name, x) = do
+  let vm0 = VMTest.vmForCase x
   putStr (name ++ " ")
   hFlush stdout
   result <- do
     action <- async $
       case mode of
         Run ->
-          Timeout.timeout (1e6 * (fromMaybe 10 timelimit)) . evaluate $ do
-            execState (VMTest.interpret . void $ EVM.Stepper.execFully) vm0
+          Timeout.timeout (1e6 * (fromMaybe 10 timelimit)) $
+            execStateT (EVM.Stepper.interpret EVM.Fetch.zero . void $ EVM.Stepper.execFully) vm0
         Debug ->
-          Just <$> EVM.TTY.runFromVM EVM.Fetch.zero vm0
+          Just <$> EVM.TTY.runFromVM Nothing EVM.Fetch.zero vm0
     waitCatch action
   case result of
     Right (Just vm1) -> do
-      ok <- VMTest.checkExpectation diffmode execmode x vm1
+      ok <- VMTest.checkExpectation diffmode x vm1
       putStrLn (if ok then "ok" else "")
       return ok
     Right Nothing -> do
@@ -545,39 +829,17 @@ runVMTest diffmode execmode mode timelimit (name, x) = do
 
 #endif
 
-interpret
-  :: (EVM.Query -> IO (EVM.EVM ()))
-  -> EVM.Stepper.Stepper a
-  -> StateT EVM.VM IO (Either EVM.Stepper.Failure a)
-interpret fetcher =
-  eval . Operational.view
+parseAbi :: (AsValue s) => s -> (Text, [AbiType])
+parseAbi abijson =
+  (signature abijson, snd
+    <$> parseMethodInput
+    <$> V.toList
+      (fromMaybe (error "Malformed function abi") (abijson ^? key "inputs" . _Array)))
 
-  where
-    eval
-      :: Operational.ProgramView EVM.Stepper.Action a
-      -> StateT EVM.VM IO (Either EVM.Stepper.Failure a)
-
-    eval (Operational.Return x) =
-      pure (Right x)
-
-    eval (action Operational.:>>= k) =
-      case action of
-        EVM.Stepper.Exec ->
-          exec >>= interpret fetcher . k
-        EVM.Stepper.Wait q ->
-          do m <- liftIO (fetcher q)
-             State.state (runState m) >> interpret fetcher (k ())
-        EVM.Stepper.Note _ ->
-          interpret fetcher (k ())
-        EVM.Stepper.Fail e ->
-          pure (Left e)
-        EVM.Stepper.EVM m ->
-          State.state (runState m) >>= interpret fetcher . k
-
-abiencode :: (AsValue s) => s -> [String] -> ByteString
-abiencode abi args =
-  let declarations = parseMethodInput <$> V.toList (abi ^?! key "inputs" . _Array)
-      sig = signature abi
+abiencode :: (AsValue s) => Maybe s -> [String] -> ByteString
+abiencode Nothing _ = error "missing required argument: abi"
+abiencode (Just abijson) args =
+  let (sig', declarations) = parseAbi abijson
   in if length declarations == length args
-     then abiMethod sig $ AbiTuple . V.fromList $ zipWith makeAbiValue (snd <$> declarations) args
+     then abiMethod sig' $ AbiTuple . V.fromList $ zipWith makeAbiValue declarations args
      else error $ "wrong number of arguments:" <> show (length args) <> ": " <> show args
